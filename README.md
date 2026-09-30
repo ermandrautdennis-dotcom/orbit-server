@@ -22,12 +22,17 @@ Railway as a single service.
 ## Flow
 
 ```
-admin  ──/genkey premium──►  key handed to user
-user   ──/key <key>───────►  bot links key to Discord user, returns loader
-user   ── runs loader ────►  loader POSTs key + HWID to /api/script
-server ── binds HWID ─────►  returns premium.lua  → loadstring runs it
-other machine, same key ──►  403 "key already locked to another machine"
+admin  ──/genkey premium──────►  key handed to user
+user   ── panel "Redeem Key" ─►  types key in popup, gets loadstring back
+         (or /key <key>)          (bot links key to their Discord user)
+user   ── runs loader ────────►  loader POSTs key + HWID to /api/script
+server ── binds HWID ─────────►  returns premium.lua  → loadstring runs it
+other machine, same key ──────►  403 "key already locked to another machine"
 ```
+
+The panel has two buttons: **🌐 Get Script (Public)** hands the free loader to
+anyone; **🔑 Redeem Key (Premium)** opens a popup where the user types their key
+and gets the loadstring with the key already baked in.
 
 ## Deploy on Railway
 

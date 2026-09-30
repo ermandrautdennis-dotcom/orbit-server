@@ -59,13 +59,15 @@ class PanelView(discord.ui.View):
         await self._serve_public(interaction, "public")
 
     @discord.ui.button(
-        label="Get Script (Premium)",
+        label="Redeem Key (Premium)",
         style=discord.ButtonStyle.success,
-        emoji="⭐",
-        custom_id="orbit:get:premium",
+        emoji="🔑",
+        custom_id="orbit:redeem:premium",
     )
-    async def premium_button(self, interaction: discord.Interaction, _button: discord.ui.Button):
-        await self._serve_premium(interaction, "premium")
+    async def redeem_button(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        # Open a popup where the user types their key. On submit they get the
+        # loadstring loader with the key baked in — no slash command needed.
+        await interaction.response.send_modal(RedeemKeyModal(tier="premium"))
 
     async def _serve_public(self, interaction: discord.Interaction, tier: str):
         # Public tier: hand over a ready-to-run loader using a shared public
@@ -80,19 +82,50 @@ class PanelView(discord.ui.View):
             embed=embed, content=f"```lua\n{loader}\n```", ephemeral=True
         )
 
-    async def _serve_premium(self, interaction: discord.Interaction, tier: str):
-        embed = discord.Embed(
-            title="⭐ Premium Script",
-            description=(
-                "Du brauchst einen gültigen Key.\n\n"
-                "**1.** Lös deinen Key ein mit `/key <dein-key>`\n"
-                "**2.** Du bekommst deinen persönlichen Loader\n"
-                "**3.** Der Key wird beim ersten Start an deine HWID gebunden — "
-                "danach läuft er nur noch auf deinem Gerät."
-            ),
-            color=EMBED_COLOR,
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ── the redeem popup ─────────────────────────────────────────────────────
+class RedeemKeyModal(discord.ui.Modal, title="Redeem Key"):
+    """Popup with a key field. Validates the key, links it to the Discord user
+    and returns the loadstring loader with the key already filled in."""
+
+    key_input: discord.ui.TextInput = discord.ui.TextInput(
+        label="Dein Lizenz-Key",
+        placeholder="ORBIT-XXXXX-XXXXX-XXXXX-XXXXX",
+        required=True,
+        min_length=4,
+        max_length=128,
+    )
+
+    def __init__(self, tier: str = "premium") -> None:
+        super().__init__()
+        self.tier = tier
+
+    async def on_submit(self, interaction: discord.Interaction):
+        key = str(self.key_input.value).strip().upper()
+        db = SessionLocal()
+        try:
+            lic = licensing.link_discord(db, key, interaction.user.id)
+            loader = build_loader(key=key, tier=lic.tier)
+            embed = _ok(
+                "✅ Key eingelöst",
+                f"Tier: **{lic.tier}**\n"
+                "Dein Loader steht unten — kopier ihn in deinen Executor. "
+                "Beim ersten Start wird der Key an deine HWID gebunden und "
+                "läuft danach nur noch auf diesem Gerät.",
+            )
+            await interaction.response.send_message(
+                embed=embed, content=f"```lua\n{loader}\n```", ephemeral=True
+            )
+            log_bot = interaction.client
+            if isinstance(log_bot, OrbitBot):
+                await log_bot.log_event(
+                    f"🔑 <@{interaction.user.id}> hat einen **{lic.tier}** key "
+                    "über das Panel eingelöst."
+                )
+        except licensing.LicenseError as exc:
+            await interaction.response.send_message(embed=_err(str(exc)), ephemeral=True)
+        finally:
+            db.close()
 
 
 # ── the bot ──────────────────────────────────────────────────────────────
@@ -140,9 +173,10 @@ def register_commands(bot: OrbitBot) -> None:
             title="🛰️  Orbit — Script Panel",
             description=(
                 "Wähl unten dein Script.\n\n"
-                "🌐 **Public** — frei für alle\n"
-                "⭐ **Premium** — Key nötig (`/key`), HWID-gebunden\n\n"
-                "Jeder Key läuft nur auf **einem** Gerät."
+                "🌐 **Public** — frei für alle, direkt laden\n"
+                "🔑 **Redeem Key** — Key eingeben, Loader zurückbekommen\n\n"
+                "Jeder Key wird an **eine** HWID gebunden — niemand sonst kann "
+                "ihn danach einlösen."
             ),
             color=EMBED_COLOR,
         )
