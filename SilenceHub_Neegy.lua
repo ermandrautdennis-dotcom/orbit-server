@@ -5075,40 +5075,9 @@ do
     outer.Size = UDim2.new(1,0,1,0)
     outer.BackgroundTransparency = 1; outer.BorderSizePixel = 0; outer.ZIndex = 22
 
-    local yHeader = PAD
-
-    local selHdr = Instance.new("TextLabel", outer)
-    selHdr.Size=UDim2.new(1,-16,0,18); selHdr.Position=UDim2.fromOffset(8,yHeader)
-    selHdr.BackgroundTransparency=1; selHdr.Text="TP ENGINE"
-    selHdr.Font=Enum.Font.GothamBold; selHdr.TextSize=10
-    selHdr.TextColor3=Color3.fromRGB(200,145,0); selHdr.TextXAlignment=Enum.TextXAlignment.Left
-    selHdr.ZIndex=23
-    yHeader = yHeader + 22
-
-    local function makeRadio(parent, x, y, lbl, active)
-        local btn=Instance.new("TextButton",parent)
-        btn.Size=UDim2.fromOffset(108,26); btn.Position=UDim2.fromOffset(x,y)
-        btn.BackgroundColor3=active and COL_SEL or Color3.fromRGB(16,12,4)
-        btn.BorderSizePixel=0; btn.Text=lbl; btn.Font=Enum.Font.GothamBold; btn.TextSize=11
-        btn.TextColor3=active and Color3.fromRGB(255,255,255) or Color3.fromRGB(110,90,40)
-        btn.ZIndex=24; Instance.new("UICorner",btn).CornerRadius=UDim.new(0,6)
-        return btn
-    end
-
-    local _activeTP = (_SH_ConfigRaw and _SH_ConfigRaw.activeTPEngine == 2) and 2 or 1
-    _G._SH_activeTPEngine = _activeTP
-
-    local tp1Btn = makeRadio(outer, 8,   yHeader, "TP 1  (Base)", _activeTP==1)
-    local tp2Btn = makeRadio(outer, 122, yHeader, "TP 2  (Taco)", _activeTP==2)
-    yHeader = yHeader + 34
-
-    local div=Instance.new("Frame",outer); div.Size=UDim2.new(1,-16,0,1)
-    div.Position=UDim2.fromOffset(8,yHeader); div.BackgroundColor3=Color3.fromRGB(80,55,0)
-    div.BorderSizePixel=0; div.ZIndex=23
-    yHeader = yHeader + 6
-
-    local panelY  = yHeader
+    local panelY  = PAD
     local panelSz = UDim2.new(1,0,1,-panelY)
+    _G._SH_activeTPEngine = 1
 
     local function makeNumRow(parent, y, lbl, getF, setF)
         local row=Instance.new("Frame",parent)
@@ -5180,7 +5149,7 @@ do
     tp1Panel.BackgroundTransparency=1; tp1Panel.BorderSizePixel=0
     tp1Panel.ScrollBarThickness=4; tp1Panel.ScrollBarImageColor3=Color3.fromRGB(160,115,0)
     tp1Panel.AutomaticCanvasSize=Enum.AutomaticSize.Y; tp1Panel.CanvasSize=UDim2.new(0,0,0,0)
-    tp1Panel.Visible=(_activeTP==1); tp1Panel.ZIndex=23
+    tp1Panel.Visible=true; tp1Panel.ZIndex=23
 
     do
         local y=PAD
@@ -5234,95 +5203,6 @@ do
                 task.spawn(saveConfig)
             end); y=y+38
     end
-
-    -- ── TP 2 Settings Panel (Taco) ─────────────────────────────────────────────
-    local tp2Panel=Instance.new("ScrollingFrame",outer)
-    tp2Panel.Size=panelSz; tp2Panel.Position=UDim2.fromOffset(0,panelY)
-    tp2Panel.BackgroundTransparency=1; tp2Panel.BorderSizePixel=0
-    tp2Panel.ScrollBarThickness=4; tp2Panel.ScrollBarImageColor3=Color3.fromRGB(160,115,0)
-    tp2Panel.AutomaticCanvasSize=Enum.AutomaticSize.Y; tp2Panel.CanvasSize=UDim2.new(0,0,0,0)
-    tp2Panel.Visible=(_activeTP==2); tp2Panel.ZIndex=23
-
-    do
-        local y=PAD
-        makeSectionHdr(tp2Panel,y,"TACO TP SETTINGS"); y=y+20
-        makeNumRow(tp2Panel,y,"Cruise Speed",
-            function() return _G.NeegyCruise or _SH_ConfigRaw.neegyCruise or 500 end,
-            function(v) _G.NeegyCruise=v end); y=y+32
-        makeNumRow(tp2Panel,y,"Climb Speed",
-            function() return _G.TacoClimb or _SH_ConfigRaw.tacoClimb or 200 end,
-            function(v) _G.TacoClimb=v end); y=y+32
-        makeNumRow(tp2Panel,y,"Close Speed",
-            function() return _G.TacoCloseSpeed or _SH_ConfigRaw.tacoCloseSpeed or 400 end,
-            function(v) _G.TacoCloseSpeed=v end); y=y+32
-        makeNumRow(tp2Panel,y,"Landing Delay",
-            function() return _G.LandingDelay or _SH_ConfigRaw.landingDelay or 0.15 end,
-            function(v) _G.LandingDelay=v end); y=y+32
-        makeNumRow(tp2Panel,y,"Hold Duration",
-            function() return _G.TacoStealHoldDuration or _SH_ConfigRaw.tacoStealHold or 1.3 end,
-            function(v) _G.TacoStealHoldDuration=v end); y=y+32
-        makeNumRow(tp2Panel,y,"Commit Range",
-            function() return _G.TacoStealCommitRange or _SH_ConfigRaw.tacoCommitRange or 30 end,
-            function(v) _G.TacoStealCommitRange=v end); y=y+32
-        makeCycleRow(tp2Panel,y,"Steal Mode",
-            {"priority","nearest","highest"},
-            function() return _G.TacoStealMode or _SH_ConfigRaw.tacoStealMode or "priority" end,
-            function(v) _G.TacoStealMode=v end); y=y+38
-
-        makeSectionHdr(tp2Panel,y,"STABLE FPS GATE"); y=y+20
-        buildMiniToggle(tp2Panel,y,"Enable FPS Gate",
-            function() return _G.SH_FPSGateEnabled==true end,
-            function(v)
-                _G.SH_FPSGateEnabled=v
-                _G.SH_Config.fpsGateEnabled=v
-                task.spawn(saveConfig)
-            end); y=y+28
-        makeNumRow(tp2Panel,y,"Min FPS",
-            function() return _G.SH_FPSGateMin or 30 end,
-            function(v)
-                _G.SH_FPSGateMin=math.max(1,math.floor(v))
-                _G.SH_Config.fpsGateMin=_G.SH_FPSGateMin
-                task.spawn(saveConfig)
-            end); y=y+32
-
-        makeSectionHdr(tp2Panel,y,"FLYING GEAR"); y=y+20
-        makeCycleRow(tp2Panel,y,"Active Tool",
-            {"Flying Carpet","Witch Broom","Waverider","Cupid's Wings","Santa's Sleigh"},
-            function()
-                return _G.MynxxCarpetTool or "Flying Carpet"
-            end,
-            function(v)
-                _G.MynxxCarpetTool = v
-                if _G.MynxxSetCarpetTool then _G.MynxxSetCarpetTool(v) end
-                if _SH_ConfigRaw then _SH_ConfigRaw.carpetTool = v end
-                task.spawn(saveConfig)
-            end); y=y+38
-    end
-
-    -- ── Engine switch logic ────────────────────────────────────────────────────
-    local function setTPEngine(n)
-        _activeTP=n; _G._SH_activeTPEngine=n
-        if n==1 then
-            tp1Btn.BackgroundColor3=COL_SEL;              tp1Btn.TextColor3=Color3.fromRGB(255,255,255)
-            tp2Btn.BackgroundColor3=Color3.fromRGB(16,12,4); tp2Btn.TextColor3=Color3.fromRGB(110,90,40)
-            _G.MynxxAutoTP=true;  _G.TacoAutoTP=false
-            tp1Panel.Visible=true; tp2Panel.Visible=false
-        else
-            tp2Btn.BackgroundColor3=COL_SEL;              tp2Btn.TextColor3=Color3.fromRGB(255,255,255)
-            tp1Btn.BackgroundColor3=Color3.fromRGB(16,12,4); tp1Btn.TextColor3=Color3.fromRGB(110,90,40)
-            _G.MynxxAutoTP=false; _G.TacoAutoTP=true
-            tp2Panel.Visible=true; tp1Panel.Visible=false
-        end
-        task.spawn(saveConfig)
-    end
-
-    _G._SH_refreshTPTab = function()
-        local eng = (_G._SH_activeTPEngine == 2) and 2 or 1
-        setTPEngine(eng)
-    end
-
-    tp1Btn.MouseButton1Click:Connect(function() setTPEngine(1) end)
-    tp2Btn.MouseButton1Click:Connect(function() setTPEngine(2) end)
 
 end
 -- ── End TP Tab Builder ────────────────────────────────────────────────────────
