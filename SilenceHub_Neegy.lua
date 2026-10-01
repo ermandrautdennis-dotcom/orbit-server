@@ -9145,6 +9145,11 @@ end
 -- ║  Merged from Silence Hub (JAF autograb) + Neegy (steal system)  ║
 -- ╚══════════════════════════════════════════════════════════════════╝
 
+
+-- ╔══════════════════════════════════════════════════════════════════╗
+-- ║  NEEGY PRIV TP ENGINE (complete, wrapped)                       ║
+-- ╚══════════════════════════════════════════════════════════════════╝
+do
 -- discord.gg/neegypriv
 --[[ === RailTP embedded engine (velocity cruise) === ]]
 do
@@ -18120,25 +18125,2320 @@ do
         return true
     end
     local function timeUntilCanSteal()
+        if LP:GetAttribute("Stealing") or LP:GetAttribute("IsTrading")
+            or LP:GetAttribute("IsDuelSelecting") or LP:GetAttribute("Web") then
+            return -1
+        end
+        local ragdoll = LP:GetAttribute("RagdollEndTime")
+        if ragdoll then
+            local r = ragdoll - workspace:GetServerTimeNow()
+            if r > 0 then return r end
+        end
+        return 0
+    end
+    local stealOn = (_G.TacoStealMode ~= nil)
+    local _emptyScans = 0
+    local _lockMiss = 0
+    local _lastGateLog, _lastGateReason = 0, ""
+    local _stealGateClearedAt = 0  -- timestamp when ETA gate last cleared; used for pre-delay
+    local function _gateLog(reason, dist, nearBase, extra)
+        if not _G.TacoLog then return end
+        local nowc = os.clock()
+        if reason == _lastGateReason and (nowc - _lastGateLog) < 0.5 then return end
+        _lastGateLog, _lastGateReason = nowc, reason
+        local d = { why = reason, dist = math.floor((tonumber(dist) or -1) * 10) / 10, nearBase = nearBase }
+        if extra then for k, v in pairs(extra) do d[k] = v end end
+        pcall(_G.TacoLog, "STEAL_GATE", d)
+    end
+    RunService.Heartbeat:Connect(function()
+        if not stealOn then return end
+        local now = os.clock()
+        local _holdNow = _G.TacoStealHold == true
+        if _wasHeld and not _holdNow then
+            _lastTargetPick, _stealLastScan, _autoLastScan = 0, 0, 0
+        end
+        _wasHeld = _holdNow
+        -- Once a steal actually fires, the chosen pet is committed; drop the
+        -- soft auto-lock so the next cycle targets the next-ranked pet. Never
+        -- touch a manual pin (that lives in _G.TacoStealTargetUID).
+        if LP:GetAttribute("Stealing") then _G.TacoTPChosenUID = nil end
+        local _manualUid = _G.TacoStealTargetUID
+        local _lockUid = (type(_manualUid) == "string" and _manualUid ~= "") and _manualUid or _G.TacoTPChosenUID
+        local _lockChanged = (type(_lockUid) == "string" and _lockUid ~= "" and _lockUid ~= _lastPickUid)
+        local _needPick = (not _stealTarget) or _lockChanged
+            or (now - _lastTargetPick) >= (tonumber(_G.TacoRepickGap) or 0.35)
+        local _scanGap = (_emptyScans >= 3) and (tonumber(_G.TacoStealIdleGap) or 0.35) or 0.033
+        if not LP:GetAttribute("Stealing") and _needPick and (now - _autoLastScan) >= _scanGap then
+            _autoLastScan = now
+            _lastTargetPick = now
+            local char = LP.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local ok, pets = pcall(scanAllPetsCached, tonumber(_G.TacoScanCacheAge) or 0.12)
+                if ok and pets and #pets > 0 then _emptyScans = 0 else _emptyScans = _emptyScans + 1 end
+                if ok and pets and #pets > 0 then
+                    local best
+                    local _hasLock = (type(_lockUid) == "string" and _lockUid ~= "")
+                    if _hasLock then
+                        -- STRICT: commit ONLY the exact plot+slot that was locked.
+                        -- If it is absent from this scan, pick nothing (keep the
+                        -- prior target / fire nothing) rather than substituting
+                        -- pets[1]. That substitution is what let the steal drift
+                        -- off the pet the TP flew to onto the #2 pet.
+                        for _, p in ipairs(pets) do
+                            if not p.conveyor and _petUid(p) == _lockUid then best = p break end
+                        end
+                        if best then
+                            _lockMiss = 0
+                        else
+                            -- Locked pet is absent from THIS scan instant. Never fall
+                            -- back to pets[1] (that is the original drift-to-#2 bug), and
+                            -- never keep a stale prior target that could fire on the
+                            -- wrong pet. Fire nothing this cycle instead.
+                            _stealTarget = nil
+                            -- If it is a SOFT auto-lock (the pet doVelocityTP flew to,
+                            -- not a manual pin) and it stays gone for several scans,
+                            -- release it so the loop can retarget the current #1 rather
+                            -- than stalling. A manual pin (_G.TacoStealTargetUID) is
+                            -- NEVER auto-released here.
+                            -- Tolerate only a SINGLE transient scan blip (that one
+                            -- missing frame was the entire drift bug); on real
+                            -- absence release the soft lock immediately so the loop
+                            -- grabs the current #1 with no perceptible stall. ~1 frame
+                            -- (~33-66ms), not the old 6-cycle wait. Manual pins never
+                            -- auto-release.
+                            _lockMiss = _lockMiss + 1
+                            if _lockMiss >= (tonumber(_G.TacoSoftLockMissMax) or 2)
+                                and not (type(_manualUid) == "string" and _manualUid ~= "") then
+                                _G.TacoTPChosenUID = nil
+                                _lockMiss = 0
+                            end
+                        end
+                    else
+                        _lockMiss = 0
+                        if _G.TacoStealMode == "nearest" then
+                            local myPos = hrp.Position
+                            local bestD = math.huge
+                            for _, p in ipairs(pets) do
+                                if not p.conveyor and p.position then
+                                    local d = (p.position - myPos).Magnitude
+                                    if d < bestD then bestD = d; best = p end
+                                end
+                            end
+                        else
+                            for _, p in ipairs(pets) do if not p.conveyor then best = p; break end end
+                        end
+                        best = best or pets[1]
+                    end
+                    if best then
+                        if best ~= _stealTarget then
+                            _stealGateClearedAt = 0
+                            -- TARGET CHANGED: abort any in-progress hold immediately.
+                            -- Without this, _stealHoldActive stays true for up to 2.3s
+                            -- (hold + verify delay) and every _directSteal(new_target)
+                            -- returns "busy" — the bar reaches 100% for the OLD pet,
+                            -- commits on the wrong pet, server rejects, and only then
+                            -- does the new target get to fire. Bumping the generation
+                            -- also stops the bar animation task from committing on the
+                            -- old pet (it checks myGen ~= _stealHoldGen before commit).
+                            if _stealHoldActive then
+                                _stealHoldGen = _stealHoldGen + 1
+                                _stealHoldActive = false
+                            end
+                        end
+                        _stealTarget = best
+                        _stealArmedAt = now
+                        _lastPickUid = _lockUid
+                        if type(best.name) == "string" and best.name ~= "" then
+                            _currentTargetName = best.name
+                        end
+                    end
+                end
+            end
+        end
+        local pet = _stealTarget
+        _G.TacoESPTPPos = pet and pet.position  -- expose for ESP line
+        if not pet then return end
+        -- FIRE-RATE: throttle to ~30Hz while idle-scanning, but run EVERY frame once
+        -- a target is LOCKED so the begin/commit lands the exact frame we're synced.
+        local _locked = (type(_lockUid) == "string" and _lockUid ~= "")
+            and (_G.TacoStealLockedFullRate ~= false)
+        if not _locked and (now - _stealLastScan) < (tonumber(_G.TacoStealFireGap) or 0.033) then return end
+        _stealLastScan = now
+        local t = timeUntilCanSteal()
+        if t == -1 then
+            if LP:GetAttribute("Stealing") then _stealTarget = nil end
+            return
+        end
+        if t > 0 and t > STEAL_HOLD_DURATION then
+            _gateLog("ragdoll_wait", -1, nil, { ragLeft = math.floor(t * 10) / 10 })
+            if _G.TacoStealDuringRagdoll == false then return end
+        end
+        local char = LP.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        -- ============================================================
+        -- UNIFIED RADIUS ARRIVAL TRIGGER (single sync gate).
+        -- Fire the hold the instant HumanoidRootPart is within
+        -- _G.TacoStealCommitRange (default 30) studs of the LOCKED target
+        -- brainrot's ProximityPrompt WORLD position. One check, every Heartbeat
+        -- while the target is locked -- correct at every base, every floor, every
+        -- TP speed, every approach mode (RailTP cruise, goToBrainrot glide,
+        -- grapple, click-TP), because it keys off the actual prompt, not an ETA
+        -- prediction or base-distance guess.
+        -- Fires via the full undetected hold sequence (executeStealAsync:
+        -- PromptButtonHoldBegan -> state guard -> HoldDuration wait -> Triggered +
+        -- PromptButtonHoldEnded). Fires once per hold (the _stealHoldActive guard
+        -- inside executeStealAsync blocks re-fires); cancels naturally when the
+        -- target is lost (pet == nil -> early return above) or the panel target
+        -- changes (loop re-locks to the new pet's prompt next frame).
+        -- _G.TacoStealRadiusTrigger = false falls back to the old ETA gate below.
+        -- ============================================================
+        if _G.TacoStealRadiusTrigger ~= false then
+            -- Timing gate keys off the SCANNED pet position (available even when the
+            -- podium is streamed out), and fires when within TacoStealCommitRange OR
+            -- when time-to-arrival <= the hold duration. The ETA term is what makes
+            -- the bar start EARLY: a fixed radius can't lead a fast cruise (90 studs
+            -- at 400/s is only 0.2s), but firing HoldDuration-before-arrival gives a
+            -- constant ~1.3s lead at ANY TP speed, so the bar fills during the
+            -- approach and completes as you land. The steal itself still fires only
+            -- through the prompt hold sequence, and the arrive-gate inside
+            -- executeStealAsync holds the real Triggered until you're in the prompt's
+            -- true range, so it can never commit early.
+            -- PROMPT CACHE: keyed by lock UID so findStealPrompt (podium walk) runs
+            -- at most once per target instead of on every Heartbeat frame. The
+            -- pre-warm task in doVelocityTP populates this before we arrive so the
+            -- very first arrival frame already has the prompt and callbacks ready.
+            local _curUid2 = type(_lockUid) == "string" and _lockUid or ""
+            if _hbPromptUid ~= _curUid2 or not (_hbPrompt and _hbPrompt.Parent) then
+                local _rp2 = findStealPrompt(pet)
+                if _rp2 and _rp2.Parent then
+                    _hbPromptUid = _curUid2
+                    _hbPrompt    = _rp2
+                    _hbTpos      = _promptWorldPos(_rp2) or pet.position
+                elseif _hbPromptUid ~= _curUid2 then
+                    -- uid changed but prompt not yet streamed; clear stale entry,
+                    -- retry next frame without locking onto nil
+                    _hbPromptUid = _curUid2
+                    _hbPrompt    = nil
+                    _hbTpos      = nil
+                end
+            end
+            local _rp   = (_hbPrompt and _hbPrompt.Parent) and _hbPrompt or nil
+            local _tpos = _hbTpos or pet.position
+            if not _tpos then return end
+            -- VELOCITY-SCALED ARRIVAL GATE (skidded from the reference sync).
+            -- The fire DISTANCE grows with closing speed so the hold bar starts
+            -- ~HoldDuration before arrival at any TP speed, then is CLAMPED to a
+            -- hard max (TacoStealMaxGate, 120) so a fast fling can never fire from
+            -- across the map -- the clamp is what makes it consistent at every base.
+            -- Below the closing-speed floor (slow / mis-aligned / parked approach)
+            -- it falls back to the fixed commit radius. Algebraically the timed
+            -- gate is just  dist <= closing * hold * factor  <=>  ETA <= hold*factor.
+            local _rd = (hrp.Position - _tpos).Magnitude
+            local _base = tonumber(_G.TacoStealCommitRange) or 30
+            local _gate = _base
+            local _to = _tpos - hrp.Position
+            local _closing = 0
+            if _to.Magnitude > 0.1 then
+                _closing = math.max(0, hrp.AssemblyLinearVelocity:Dot(_to.Unit))
+            end
+            if _closing > (tonumber(_G.TacoStealCloseMin) or 40) then
+                local _hold = tonumber(_G.TacoStealHoldDuration) or STEAL_HOLD_DURATION
+                local _factor = tonumber(_G.TacoStealTimedFactor) or 1.5
+                local _maxGate = tonumber(_G.TacoStealMaxGate) or 175
+                _gate = math.clamp(_closing * _hold * _factor, _base, _maxGate)
+            end
+            -- During velMoveThrough the early-steal task already started the hold
+            -- bar and the arrive-gate is waiting for proximity. Block the radius
+            -- trigger from starting a second hold on the same cycle.
+            local _phase = _G._TacoGrabPhase
+            if (_phase == "moving" or _phase == "locked") and _stealHoldActive then
+                return
+            end
+            local _go = _rd <= _gate
+            if not _go then _gateLog("radius_wait", _rd, false, { r = _gate }); return end
+            -- prompt not streamed in yet -- keep gating, fire the frame it appears.
+            if not (_rp and _rp.Parent) then return end
+            -- run the undetected prompt hold sequence.
+            local _oldMax
+            pcall(function() _oldMax = _rp.MaxActivationDistance end)
+            pcall(function() _rp.MaxActivationDistance = math.huge end)
+            buildStealCallbacks(_rp)
+            if InternalStealCache[_rp] then
+                if not executeStealAsync(_rp, pet.name, _oldMax) and _oldMax ~= nil then
+                    pcall(function() _rp.MaxActivationDistance = _oldMax end)
+                end
+            elseif fireproximityprompt then
+                showStealBar(pet.name, 1)
+                pcall(function() fireproximityprompt(_rp) end)
+                task.delay(0.4, hideStealBar)
+                pcall(function() if _oldMax ~= nil then _rp.MaxActivationDistance = _oldMax end end)
+            end
+            return
+        end
+        if pet.position then
+            local _hbPos = pet._hbPos
+            local _hbGap = pet._hbPos and 2 or (tonumber(_G.TacoHitboxRetryGap) or 0.25)
+            if pet._hbAt == nil or (now - pet._hbAt) > _hbGap then
+                pet._hbAt = now
+                pcall(function()
+                    local plots = workspace:FindFirstChild("Plots")
+                    local plot = plots and pet.plot and plots:FindFirstChild(tostring(pet.plot))
+                    local host = plot or plots
+                    if host then
+                        local best2, bestD2 = nil, math.huge
+                        for _, d in ipairs(host:GetDescendants()) do
+                            if d.Name == "StealHitbox" and d:IsA("BasePart") then
+                                local dd = (d.Position - pet.position).Magnitude
+                                if dd < bestD2 then bestD2 = dd; best2 = d end
+                            end
+                        end
+                        if best2 and bestD2 < (tonumber(_G.TacoHitboxMatchRadius) or 35) then
+                            pet._hbPos = best2.Position
+                        end
+                    end
+                end)
+                _hbPos = pet._hbPos
+            end
+            local toPet = pet.position - hrp.Position
+            local dist = toPet.Magnitude
+            if _hbPos then
+                local dHb = (_hbPos - hrp.Position).Magnitude
+                if dHb < dist then dist = dHb end
+            end
+            local hold = tonumber(_G.TacoStealHoldDuration) or STEAL_HOLD_DURATION
+            -- ETA slack: how many seconds BEFORE arrival the hold-bar fires.
+            -- 0.12s (was 0.08s) gives the bar a slightly longer runway so the
+            -- commit lands at arrival rather than 0.08s after. At cruise 400 stud/s
+            -- that is 48 studs inside the brake zone — still well within range.
+            -- Tune with _G.TacoStealETASlack.
+            local slack = tonumber(_G.TacoStealETASlack) or 0.12
+            local vel = hrp.AssemblyLinearVelocity
+            local speed = vel.Magnitude
+            local cruise = tonumber(_G.NeegyCruise) or 400
+            -- FLING GUARD: during a grapple fling the character velocity spikes
+            -- well above cruise. Refuse to fire the begin remote until velocity
+            -- settles back into cruise range so the bar doesn't start mid-grapple.
+            if speed > cruise * (tonumber(_G.TacoFlingMult) or 1.6) then
+                _gateLog("fling_wait", dist, false, { speed = math.floor(speed), cruise = math.floor(cruise) }); return
+            end
+            -- Closing speed clamped to cruise so grapple/fling residual velocity
+            -- can't fake a tiny ETA while we're still 800 studs away.
+            local closingRaw = dist > 0.001 and (vel:Dot(toPet) / dist) or 0
+            local closing = math.min(math.max(closingRaw, 1), cruise * 1.1)
+            local eta = dist / closing
+            -- RAIL-AWARE ETA: if RailTP is cruising (we know we'll travel at
+            -- cruise speed straight at the target), synthesize the ETA from
+            -- dist/cruise instead of trusting instantaneous velocity dot.
+            -- This fixes the 50/50 far-brainrot sync: without this, a curved
+            -- rail approach or fresh-launch cruise reads closingRaw as tiny
+            -- and the gate never fires, so bar starts at 0% on arrival.
+            -- UNIFIED SYNC GATE
+            -- Goal: bar hits 100% the exact frame you arrive at the brainrot,
+            -- regardless of transport mode (RailTP cruise, goToBrainrot flight,
+            -- grapple, walkspeed, click-TP), from any area of any base.
+            --
+            -- Strategy: pick an effective approach speed from the strongest
+            -- available signal, then compute brake-aware ETA. If any TP engine
+            -- is transporting us (_railActive OR _G.TacoTPActive), we KNOW we
+            -- will arrive — use predictive speed even if instantaneous closing
+            -- is momentarily low (curved approach, mid-brake, mid-hop).
+            local _railActive = _G.RailTP and _G.RailTP.isActive and _G.RailTP.isActive()
+            local _tpActive = _railActive or (_G.TacoTPActive == true)
+            -- Track last-active timestamp for spawn-guard on parked commits.
+            if _tpActive then _G._TacoLastTPActiveAt = os.clock() end
+            if _tpActive then
+                -- PATH-AWARE EFFECTIVE CRUISE
+                -- Straight-line ETA breaks when the transport engine detours
+                -- around a base wall / neighbor podium — actual arc length is
+                -- 1.2-1.8x straight-line, so dist/cruise underestimates and
+                -- the bar fires way too early (or overshoots on arrival).
+                -- Fix: measure REAL straight-line-distance-closed over a
+                -- sliding 0.5s window. If path curves, closed-per-second is
+                -- naturally smaller than raw cruise, and ETA lengthens to
+                -- match the actual arc travel time.
+                _G._TacoStealDistHist = _G._TacoStealDistHist or {}
+                local hist = _G._TacoStealDistHist
+                local _now = os.clock()
+                table.insert(hist, { t = _now, d = dist })
+                local win = tonumber(_G.TacoStealCloseWindow) or 0.5
+                while #hist > 1 and (_now - hist[1].t) > win do
+                    table.remove(hist, 1)
+                end
+                local measuredClose = 0
+                if #hist >= 2 then
+                    local dt = _now - hist[1].t
+                    local dd = hist[1].d - dist
+                    if dt > 0.05 and dd > 0 then measuredClose = dd / dt end
+                end
+                -- Pick the truthful speed: measured (if we have it and it's
+                -- reasonable) else fall back to closingRaw / cruise floor.
+                -- Clamped to [cruise*0.25, cruise*1.1] so a bad sample can't
+                -- stall the gate or make ETA vanish.
+                local effCruise
+                if measuredClose > 1 then
+                    effCruise = math.clamp(measuredClose, cruise * 0.25, cruise * 1.1)
+                else
+                    effCruise = math.max(closingRaw, cruise * 0.5, 100)
+                end
+                -- Brake budget: seconds reserved for final decel + settle.
+                -- Rail = full quadratic brake (1.9s over 60 studs).
+                -- Non-rail engines (goToBrainrot) usually finish with an
+                -- instant CFrame land, so a much smaller budget of 0.4s
+                -- covers the last-frame commit. Override with
+                -- _G.TacoGoToBrakeBudget if your goToBrainrot engine
+                -- physically decelerates instead of snapping.
+                local brakeRadius = tonumber(_G.TacoRailBrakeRadius) or 60
+                local brakeBudget
+                if _railActive then
+                    brakeBudget = tonumber(_G.TacoRailBrakeBudget) or 1.75
+                else
+                    brakeBudget = tonumber(_G.TacoGoToBrakeBudget) or 0.25
+                end
+                -- FAR-BASE PAD: when the target base is far (curved/long
+                -- approach), the last 60-stud brake segment tends to actually
+                -- take slightly longer than the near-base calibrated brake
+                -- budget (kinetic energy at brake-in is higher; rail's damping
+                -- is quadratic). Without a pad, bar undershoots 100% on
+                -- arrival at distant bases. Pad linearly ramps in past
+                -- TacoStealFarThreshold studs, up to TacoStealFarPadMax.
+                -- Tune with _G.TacoStealFarThreshold (default 200 studs) and
+                -- _G.TacoStealFarPadMax (default 0.6s at 800+ studs).
+                local farThresh = tonumber(_G.TacoStealFarThreshold) or 150
+                local farPadMax = tonumber(_G.TacoStealFarPadMax) or 1.2
+                local farRamp = tonumber(_G.TacoStealFarPadRamp) or 500
+                if dist > farThresh then
+                    local pad = math.min(farPadMax, ((dist - farThresh) / farRamp) * farPadMax)
+                    brakeBudget = brakeBudget + pad
+                end
+                local tpEta
+                if dist > brakeRadius then
+                    tpEta = (dist - brakeRadius) / math.max(effCruise, 1) + brakeBudget
+                else
+                    tpEta = brakeBudget * (dist / math.max(brakeRadius, 1))
+                end
+                if tpEta > hold + slack then
+                    _gateLog("tp_eta_wait", dist, false,
+                        { eta = math.floor(tpEta * 100) / 100, cruise = math.floor(effCruise), hold = hold,
+                          mode = _railActive and "rail" or "flight" }); return
+                end
+                -- fall through: fire begin, bar animates during final approach
+            elseif closingRaw > 20 then
+                -- Own-power approach (walkspeed / grapple residual). Fire when
+                -- time-to-arrival <= hold + slack so bar animates 0->100%
+                -- during the last leg and completes exactly on landing.
+                if eta > hold + slack then
+                    _gateLog("eta_wait", dist, false,
+                        { eta = math.floor(eta * 100) / 100, closing = math.floor(closing), hold = hold }); return
+                end
+            else
+                -- Parked / dropped-pet commit gate: require range to the real
+                -- hitbox before firing so a stationary approach doesn't burn the
+                -- hold while still far off the pet.
+                -- SPAWN GUARD: only allow a parked commit if we RECENTLY had a
+                -- TP engine active. Without this, if you just spawned/respawned
+                -- and the panel scan picks a pet whose podium happens to be
+                -- within commit range of your spawn position, the gate fires
+                -- immediately with no TP travel — auto-steal launches at spawn.
+                -- Tunable: _G.TacoStealSpawnGuardWindow (seconds).
+                local _spawnGuardWin = tonumber(_G.TacoStealSpawnGuardWindow) or 3
+                local _lastTP = _G._TacoLastTPActiveAt or 0
+                -- Guard only applies while the "no TP yet this life" flag is set.
+                -- CharacterAdded resets it; the first successful TP clears it for
+                -- the rest of this life. This prevents both: (a) rogue spawn-time
+                -- fire, and (b) legit parked commits being refused just because
+                -- more than 3s passed since the last TP.
+                -- SPAWN GUARD DISABLED: caused legit parked commits to be refused.
+                -- Re-enable by setting _G.TacoStealSpawnGuardOn = true.
+                if _G.TacoStealSpawnGuardOn == true and _G._TacoNeedsSpawnGuard ~= false then
+                    if (os.clock() - _lastTP) > _spawnGuardWin then
+                        _gateLog("spawn_guard", dist, false, { since_tp = math.floor((os.clock() - _lastTP) * 10) / 10 }); return
+                    else
+                        _G._TacoNeedsSpawnGuard = false
+                    end
+                end
+                -- Default 30 (raised from 16) so upper-floor clone spots (which
+                -- are typically 20-28 studs from the floor-2/3 hitbox) still fire.
+                -- Tune with _G.TacoStealCommitRange.
+                local _commitRange = tonumber(_G.TacoStealCommitRange) or 30
+                if dist > _commitRange then
+                    _gateLog("still_far", dist, false, { prox = _commitRange }); return
+                end
+            end
+        end
+        -- Pre-steal settle delay: optional extra wait before the hold-bar fires.
+        -- Default 0 (no delay) — removing the old 0.1s default shaves ~100ms of
+        -- perceived lag. Brainrot protection now comes from the heartbeat retry
+        -- loop rather than a fixed wait. Set _G.TacoStealPreDelay > 0 to restore
+        -- a delay if your server needs extra settle time.
+        do
+            local preDelay = tonumber(_G.TacoStealPreDelay)
+            if preDelay == nil then preDelay = 0 end
+            local _moving = (hrp.AssemblyLinearVelocity.Magnitude > 20)
+            if preDelay > 0 and _moving then
+                if _stealGateClearedAt == 0 then _stealGateClearedAt = now end
+                if (now - _stealGateClearedAt) < preDelay then return end
+            end
+        end
+        -- SPEC SYNC: the hold bar must START the instant we are in STEAL RANGE of
+        -- the ProximityPrompt itself -- not earlier (floating out of range with an
+        -- empty bar) and not on a base-distance guess. Keyed to the prompt, so it is
+        -- correct on every base and every floor. _G.TacoStealPromptGate = false off.
+        local prompt = findStealPrompt(pet)
+        if not prompt or not prompt.Parent then return end
+        if _G.TacoStealPromptGate ~= false then
+            local _rng = tonumber(prompt.MaxActivationDistance)
+            if not _rng or _rng <= 0 or _rng == math.huge then _rng = tonumber(_G.TacoStealPromptRange) or 12 end
+            local _pp = _promptWorldPos(prompt)
+            if _pp then
+                local _pd = (hrp.Position - _pp).Magnitude
+                if _pd > _rng + (tonumber(_G.TacoStealRangePad) or 2) then
+                    _gateLog("prompt_far", _pd, false, { rng = _rng }); return
+                end
+            end
+        end
+        if _G.TacoRemoteStealOn ~= false then
+            local _rok = remoteStealAsync(pet)
+            _gateLog(_rok and "remote_fire" or "remote_false", pet.position and (pet.position - hrp.Position).Magnitude or -1, nil,
+                { plot = type(pet.plot) == "string", slot = pet.slot ~= nil, held = _stealHoldActive })
+            if _rok then return end
+        end
+        local oldMax
+        pcall(function() oldMax = prompt.MaxActivationDistance end)
+        pcall(function() prompt.MaxActivationDistance = math.huge end)
+        buildStealCallbacks(prompt)
+        if InternalStealCache[prompt] then
+            if not executeStealAsync(prompt, pet.name, oldMax) and oldMax ~= nil then
+                pcall(function() prompt.MaxActivationDistance = oldMax end)
+            end
+        elseif fireproximityprompt then
+            pcall(function() prompt.MaxActivationDistance = math.huge end)
+            showStealBar(pet.name, 1)
+            pcall(function() fireproximityprompt(prompt) end)
+            task.delay(0.4, hideStealBar)
+            pcall(function() if oldMax ~= nil then prompt.MaxActivationDistance = oldMax end end)
+        end
+    end)
+    do
+        local function applyUnwalkAlways(char)
+            if not char then return end
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            local animator = hum and hum:FindFirstChildOfClass("Animator")
+            local animate = char:FindFirstChild("Animate")
+            if animate then
+                pcall(function() animate.Disabled = true end)
+            end
+            if animator then
+                pcall(function()
+                    for _, t in ipairs(animator:GetPlayingAnimationTracks()) do t:Stop(0) end
+                end)
+                pcall(function()
+                    if animator.GetLoadedAnimationTracks then
+                        for _, t in ipairs(animator:GetLoadedAnimationTracks()) do
+                            t:Stop(0); t:Destroy()
+                        end
+                    end
+                end)
+            end
+        end
+        local function hook(char)
+            task.spawn(function()
+                char:WaitForChild("Humanoid", 10); task.wait(0.05)
+                for i = 1, 8 do
+                    if LP.Character ~= char then break end
+                    applyUnwalkAlways(char); task.wait(0.25)
+                end
+            end)
+        end
+        task.spawn(function()
+            if LP.Character then hook(LP.Character) end
+            LP.CharacterAdded:Connect(hook)
+            local function watchAnimator(char)
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                local animator = hum and hum:FindFirstChildOfClass("Animator")
+                if not animator then return end
+                pcall(function()
+                    animator.AnimationPlayed:Connect(function(track)
+                        pcall(function() track:Stop(0) end)
+                    end)
+                end)
+            end
+            if LP.Character then watchAnimator(LP.Character) end
+            LP.CharacterAdded:Connect(function(c)
+                task.delay(0.2, function() watchAnimator(c) end)
+            end)
+            local _unwalkLast = 0
+            RunService.Heartbeat:Connect(function()
+                local now = os.clock()
+                if now - _unwalkLast < (tonumber(_G.TacoUnwalkGap) or 0.2) then return end
+                _unwalkLast = now
+                if LP.Character then applyUnwalkAlways(LP.Character) end
+            end)
+        end)
+    end
+    local HS = game:GetService("HttpService")
+    local UIS = game:GetService("UserInputService")
+    local CFG_FILE = "neegy_rail.cfg"
+    local function loadCfgTable()
+        local t = {}
+        if readfile then
+            pcall(function()
+                local raw = readfile(CFG_FILE)
+                if type(raw) == "string" and #raw > 0 then
+                    local ok, d = pcall(HS.JSONDecode, HS, raw)
+                    if ok and type(d) == "table" then t = d end
+                end
+            end)
+        end
+        return t
+    end
+    local function saveTpSettings()
+        if not writefile then return end
+        local t = loadCfgTable()
+        t.tpVelocity = tonumber(_G.NeegyCruise) or 400
+        t.climbSpeed = tonumber(_G.TacoClimb) or 160
+        t.goSpeed = tonumber(_G.TacoGoSpeed) or 200
+        t.cframeSpeed = tonumber(_G.TacoCFrameSpeed) or 450
+        t.walkSpeed = tonumber(_G.TacoWalkSpeed) or 27
+        t.landingDelay = tonumber(_G.LandingDelay) or 0.35
+        t.closeSpeed = tonumber(_G.TacoCloseSpeed) or 400
+        t.autoTp = _G.TacoAutoTP ~= false
+        t.kickToPS = _G.TacoKickToPS == true
+        t.psLink = tostring(_G.TacoPrivateServerLink or "")
+        t.priAlert = _G.TacoPriAlert == true
+        t.alertSound = tostring(_G.TacoAlertSound or "111786441593851")
+        t.alertMinGen = tonumber(_G.TacoAlertMinGen) or 80e6
+        t.walkSpeedOn = _G.TacoWalkSpeedOn ~= false
+        t.xray = _G.TacoXray ~= false
+        t.invisAuto = _G.TacoInvisAuto == true
+        t.autoKickOnSteal = _G.TacoAutoKickOnSteal == true
+        t.faceAwayNearest = _G.TacoFaceAwayNearest == true
+        t.faceAwayOwner   = _G.TacoFaceAwayOwner == true
+        t.carpetTool = (type(_G.TacoCarpetTool) == "string" and _G.TacoCarpetTool ~= "")
+            and _G.TacoCarpetTool or nil
+        do
+            local out = {}
+            for k, v in pairs(_G.TacoUIPos or {}) do
+                if type(k) == "string" and type(v) == "table" then
+                    out[k] = { x = tonumber(v.x), y = tonumber(v.y),
+                        w = tonumber(v.w), h = tonumber(v.h) }
+                end
+            end
+            t.uiPos = out
+        end
+        t.invisDepth = tonumber(_G.TacoInvisDepth) or 4.2
+        t.invisAngle = tonumber(_G.TacoInvisAngle) or 180
+        t.autoSteal = stealOn
+        t.stealMode = _G.TacoStealMode
+        t.priorityList = _G.SHARED_PRIORITY_ITEMS
+        t.panelX = tonumber(_G._nrail_panelX)
+        t.panelY = tonumber(_G._nrail_panelY)
+        t.panelPos = _G._nrail_pos
+        if type(_G.TacoCloneKeyName)  == "string" then t.cloneKey  = _G.TacoCloneKeyName  else t.cloneKey  = nil end
+        if type(_G.TacoInstantCloneKeyName) == "string" then t.instantCloneKey = _G.TacoInstantCloneKeyName else t.instantCloneKey = nil end
+        if type(_G.TacoKickKeyName)   == "string" then t.kickKey   = _G.TacoKickKeyName   else t.kickKey   = nil end
+        if type(_G.TacoStopTPKeyName) == "string" then t.stopTpKey = _G.TacoStopTPKeyName else t.stopTpKey = nil end
+        if type(_G.TacoNearestKey)    == "string" then t.nearestKey= _G.TacoNearestKey    else t.nearestKey= nil end
+        if type(_G.TacoDropKeyName)   == "string" then t.dropKey   = _G.TacoDropKeyName   else t.dropKey   = nil end
+        if type(_G.TacoResetKeyName)  == "string" then t.resetKey  = _G.TacoResetKeyName  else t.resetKey  = nil end
+        t.antiFlash = _G.TacoAntiFlash ~= false
+        t.faceAway = _G.TacoFaceAway == true
+        t.faceAwayNearest = _G.TacoFaceAwayNearest == true
+        t.faceAwayDelay = tonumber(_G.TacoFaceAwayDelay) or 2
+        t.antiBee   = _G.TacoAntiBee ~= false
+        t.infJump   = _G.TacoInfJump ~= false
+        t.antiDie   = _G.AntiDieDisabled ~= true
+        t.carpetSpeedValue = tonumber(_G.TacoCarpetSpeedValue) or 140
+        t.autoBuy = _G.TacoAutoBuy == true
+        t.autoBuyRange = tonumber(_G.TacoAutoBuyRange) or 17
+        t.autoBuyHover = tonumber(_G.TacoAutoBuyHover) or 9
+        t.exX = tonumber(_G._taco_exX); t.exY = tonumber(_G._taco_exY)
+        t.fX  = tonumber(_G._taco_fX);  t.fY  = tonumber(_G._taco_fY)
+        t.kX  = tonumber(_G._taco_kX);  t.kY  = tonumber(_G._taco_kY)
+        pcall(function() writefile(CFG_FILE, HS:JSONEncode(t)) end)
+    end
+    _G.TacoSaveSettings = saveTpSettings
+    if _G.NeegyCruise == nil then _G.NeegyCruise = 400 end
+    if _G.TacoClimb == nil then _G.TacoClimb = 160 end
+    if _G.TacoGoSpeed == nil then _G.TacoGoSpeed = 200 end
+    if _G.TacoCFrameSpeed == nil then _G.TacoCFrameSpeed = 450 end
+    if _G.TacoWalkSpeed == nil then _G.TacoWalkSpeed = 27 end
+    if _G.LandingDelay == nil then _G.LandingDelay = 0.35 end
+    if _G.TacoCloseSpeed == nil then _G.TacoCloseSpeed = 400 end
+    if _G.TacoInvisDepth == nil then _G.TacoInvisDepth = 4.2 end
+    if _G.TacoInvisAngle == nil then _G.TacoInvisAngle = 180 end
+    local TS = game:GetService("TweenService")
+    local EASE = TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local function tween(o, props) TS:Create(o, EASE, props):Play() end
+    task.spawn(function()
+    -- Steal bar and TARGETS are already on screen. These two control panels
+    -- come up NeegyPanelDelay seconds later so the first TP has a clean
+    -- frame budget. Set _G.NeegyPanelDelay = 0 for instant.
+    do
+        -- Defer the control panels off the load frames so the scanner + first TP
+        -- get a clean budget at startup (steal bar + TARGETS are already up).
+        -- _G.NeegyPanelDelay = 0 for instant panels.
+        local _pd = tonumber(_G.NeegyPanelDelay) or 1.5
+        if _pd > 0 then task.wait(_pd) end
+    end
+    local guiParent = (gethui and gethui()) or game:GetService("CoreGui") or PG
+    for _, par in ipairs({ guiParent, PG }) do
+        pcall(function()
+            for _, n in ipairs({ "NeegyPriv", "NeegyTuning", "NeegyFaceAway", "NeegyInvis", "NeegyTpSettings", "TacoTP", "TacoTuning" }) do
+                local old = par:FindFirstChild(n)
+                if old then old:Destroy() end
+            end
+        end)
+    end
+    local LP2  = game:GetService("Players").LocalPlayer
+    local UIS2 = game:GetService("UserInputService")
+    local TS2  = game:GetService("TweenService")
+    local RS2  = game:GetService("RunService")
+    local BG    = Color3.fromRGB(10, 8, 18)
+    local HDR   = Color3.fromRGB(16, 14, 26)
+    local HDR2C = Color3.fromRGB(16, 14, 26)
+    local BOFF  = Color3.fromRGB(22, 20, 34)
+    local BON   = Color3.fromRGB(200, 168, 75)
+    local BDIV  = Color3.fromRGB(38, 34, 52)
+    local TXT   = Color3.fromRGB(218, 208, 182)
+    local DIM   = Color3.fromRGB(90, 82, 62)
+    local SM    = Color3.fromRGB(30, 28, 44)
+    local FB2   = Enum.Font.GothamBold
+    local FBK2  = Enum.Font.GothamBlack
+    local BH2   = 26
+    local PW    = 185
+    local function mk2(cls, parent, props)
+        local o = Instance.new(cls)
+        for k,v in pairs(props or {}) do o[k]=v end
+        o.Parent = parent; return o
+    end
+    local function c2(o,r) mk2("UICorner",o,{CornerRadius=UDim.new(0,r or 6)}) end
+    local function tw2(o,p) TS2:Create(o,TweenInfo.new(0.12,Enum.EasingStyle.Quint),p):Play() end
+    -- Yellow accent ON, dark OFF (applied across all mk2 panels)
+    local P_ON  = Color3.fromRGB(200, 168, 75)
+    local P_OFF = Color3.fromRGB(22, 20, 34)
+    local P_TXT = Color3.fromRGB(218, 208, 182)
+    local P_DIM = Color3.fromRGB(90, 82, 62)
+    local function paint2(b,on)
+        b.BackgroundColor3 = on and P_ON or P_OFF
+        b.TextColor3       = on and Color3.fromRGB(255, 255, 255) or P_DIM
+    end
+    local function mkPanel2(name, title, w, px, py)
+        local old2 = PG:FindFirstChild(name); if old2 then old2:Destroy() end
+        local sg2 = mk2("ScreenGui",nil,{Name=name,ResetOnSpawn=false,IgnoreGuiInset=true,
+            DisplayOrder=999997,ZIndexBehavior=Enum.ZIndexBehavior.Sibling})
+        pcall(function() sg2.Parent = guiParent end)
+        if not sg2.Parent then sg2.Parent = PG end
+        local frame = mk2("Frame",sg2,{Name="Main",BackgroundColor3=BG,BorderSizePixel=0,
+            Size=UDim2.fromOffset(w,10),AutomaticSize=Enum.AutomaticSize.Y,
+            Position=UDim2.fromOffset(px,py),ClipsDescendants=false})
+        if _G.TacoUIRegister then pcall(_G.TacoUIRegister, name, frame) end
+        c2(frame,10)
+        mk2("UIStroke",frame,{Color=Color3.fromRGB(48, 44, 64),Thickness=1,Transparency=0})
+        local fList = mk2("UIListLayout",frame,{SortOrder=Enum.SortOrder.LayoutOrder,Padding=UDim.new(0,0)})
+        local hdr2 = mk2("Frame",frame,{LayoutOrder=0,Size=UDim2.new(1,0,0,30),
+            BackgroundColor3=HDR,BorderSizePixel=0})
+        c2(hdr2,10)
+        -- flat warm divider at bottom of header
+        mk2("Frame",hdr2,{AnchorPoint=Vector2.new(0,1),Position=UDim2.new(0,0,1,0),
+            Size=UDim2.new(1,0,0,1),BackgroundColor3=BDIV,BorderSizePixel=0})
+        mk2("TextLabel",hdr2,{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,
+            Text=title,Font=FBK2,TextSize=12,TextColor3=P_TXT,
+            TextXAlignment=Enum.TextXAlignment.Center})
+        local drag,ds,dp = false,nil,nil
+        hdr2.InputBegan:Connect(function(i)
+            if _G.__TacoSizing then return end
+            if i.UserInputType~=Enum.UserInputType.MouseButton1 and i.UserInputType~=Enum.UserInputType.Touch then return end
+            drag=true; ds=i.Position; local a=frame.AbsolutePosition; dp=UDim2.fromOffset(a.X,a.Y); frame.Position=dp
+        end)
+        UIS2.InputChanged:Connect(function(i)
+            if not drag then return end
+            if i.UserInputType~=Enum.UserInputType.MouseMovement and i.UserInputType~=Enum.UserInputType.Touch then return end
+            local d=i.Position-ds; frame.Position=UDim2.fromOffset(dp.X.Offset+d.X,dp.Y.Offset+d.Y)
+        end)
+        UIS2.InputEnded:Connect(function(i)
+            if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+                if drag and _G.TacoUIRemember then pcall(_G.TacoUIRemember, name, frame) end
+                drag=false
+            end
+        end)
+        if _G.TacoMakeDraggable then pcall(_G.TacoMakeDraggable, frame, name) end
+        local lo = 1
+        local grip_ref = nil  -- set after all items added
+        local function addDiv()
+            lo=lo+1; mk2("Frame",frame,{LayoutOrder=lo,Size=UDim2.new(1,0,0,1),BackgroundTransparency=1,BorderSizePixel=0})
+        end
+        local function addPad(h)
+            lo=lo+1; mk2("Frame",frame,{LayoutOrder=lo,Size=UDim2.new(1,0,0,h),BackgroundTransparency=1,BorderSizePixel=0})
+        end
+        local function addToggle(text, default)
+            lo=lo+1
+            local row=mk2("Frame",frame,{LayoutOrder=lo,Size=UDim2.new(1,0,0,BH2+4),BackgroundTransparency=1,BorderSizePixel=0})
+            mk2("UIPadding",row,{PaddingLeft=UDim.new(0,5),PaddingRight=UDim.new(0,5),PaddingTop=UDim.new(0,2),PaddingBottom=UDim.new(0,2)})
+            local b=mk2("TextButton",row,{Size=UDim2.new(1,0,1,0),BackgroundColor3=BOFF,
+                BorderSizePixel=0,Text=text,Font=FB2,TextSize=11,
+                TextColor3=DIM,AutoButtonColor=false})
+            c2(b,6)
+            paint2(b, default or false)
+            b.MouseButton1Down:Connect(function() b.BackgroundTransparency=0.25 end)
+            b.MouseButton1Up:Connect(function() b.BackgroundTransparency=0 end)
+            local state={on=default or false,btn=b,textOff=text:gsub(": ON$",": OFF"),textOn=text:gsub(": OFF$",": ON")}
+            b.MouseButton1Click:Connect(function()
+                state.on=not state.on; paint2(b,state.on)
+                b.Text=state.on and state.textOn or state.textOff
+                -- Runs AFTER the flip, in the same handler. No second
+                -- connection, so no fire-order race, so the value that
+                -- reaches saveTpSettings() is the value on the button.
+                if type(state.onChange)=="function" then
+                    local ok,err=pcall(state.onChange,state.on)
+                    if not ok and _G.TacoLog then pcall(_G.TacoLog,"TOGGLE_ERR",{e=tostring(err)}) end
+                end
+            end)
+            return state
+        end
+        local function addBtnSm(mainText, smText, mainOn)
+            lo=lo+1
+            local row=mk2("Frame",frame,{LayoutOrder=lo,Size=UDim2.new(1,0,0,BH2+4),BackgroundTransparency=1,BorderSizePixel=0})
+            mk2("UIPadding",row,{PaddingLeft=UDim.new(0,5),PaddingRight=UDim.new(0,5),PaddingTop=UDim.new(0,2),PaddingBottom=UDim.new(0,2)})
+            local lay=mk2("UIListLayout",row,{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,3),
+                SortOrder=Enum.SortOrder.LayoutOrder,VerticalAlignment=Enum.VerticalAlignment.Center})
+            local mb=mk2("TextButton",row,{LayoutOrder=1,Size=UDim2.new(1,-28,1,0),
+                BackgroundColor3=mainOn and BON or BOFF,BorderSizePixel=0,Text=mainText,
+                Font=FB2,TextSize=11,TextColor3=DIM,AutoButtonColor=false})
+            c2(mb,6)
+            local sb=mk2("TextButton",row,{LayoutOrder=2,Size=UDim2.fromOffset(22,BH2),
+                BackgroundColor3=SM,BorderSizePixel=0,Text=smText,Font=FBK2,TextSize=11,
+                TextColor3=DIM,AutoButtonColor=false})
+            c2(sb,6)
+            return mb,sb
+        end
+        local function addBtn(text, bg2)
+            lo=lo+1
+            local row=mk2("Frame",frame,{LayoutOrder=lo,Size=UDim2.new(1,0,0,BH2+4),BackgroundTransparency=1,BorderSizePixel=0})
+            mk2("UIPadding",row,{PaddingLeft=UDim.new(0,5),PaddingRight=UDim.new(0,5),PaddingTop=UDim.new(0,2),PaddingBottom=UDim.new(0,2)})
+            local b=mk2("TextButton",row,{Size=UDim2.new(1,0,1,0),BackgroundColor3=bg2 or BOFF,
+                BorderSizePixel=0,Text=text,Font=FB2,TextSize=11,TextColor3=DIM,AutoButtonColor=false})
+            c2(b,6)
+            return b
+        end
+        local function addSetting(labelTxt, initVal, step2, minV, maxV, fmt2, onSet2)
+            lo=lo+1
+            local row=mk2("Frame",frame,{LayoutOrder=lo,Size=UDim2.new(1,0,0,22),BackgroundTransparency=1,BorderSizePixel=0})
+            mk2("UIPadding",row,{PaddingLeft=UDim.new(0,7),PaddingRight=UDim.new(0,7),PaddingTop=UDim.new(0,3),PaddingBottom=UDim.new(0,3)})
+            local lbl=mk2("TextLabel",row,{Size=UDim2.new(1,-52,1,0),BackgroundTransparency=1,
+                Font=FB2,TextSize=10,TextColor3=DIM,TextXAlignment=Enum.TextXAlignment.Left})
+            local val2=initVal
+            local function fmtV(v) return labelTxt..": "..(fmt2 and string.format(fmt2,v) or tostring(v)) end
+            lbl.Text=fmtV(val2)
+            local bRow=mk2("Frame",row,{Size=UDim2.fromOffset(48,16),Position=UDim2.new(1,-48,0.5,-8),BackgroundTransparency=1,BorderSizePixel=0})
+            mk2("UIListLayout",bRow,{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,2),VerticalAlignment=Enum.VerticalAlignment.Center})
+            local function mkPM2(t)
+                local b=mk2("TextButton",bRow,{Size=UDim2.fromOffset(23,16),BackgroundColor3=P_OFF,BorderSizePixel=0,
+                    Text=t,Font=FBK2,TextSize=12,TextColor3=P_DIM,AutoButtonColor=false})
+                c2(b,4); return b
+            end
+            local mB=mkPM2("-"); local pB=mkPM2("+")
+            mB.MouseButton1Click:Connect(function() val2=math.max(minV,val2-step2); lbl.Text=fmtV(val2); if onSet2 then onSet2(val2) end end)
+            pB.MouseButton1Click:Connect(function() val2=math.min(maxV,val2+step2); lbl.Text=fmtV(val2); if onSet2 then onSet2(val2) end end)
+            return {
+                setValue = function(v)
+                    val2 = math.max(minV, math.min(maxV, v))
+                    lbl.Text = fmtV(val2)
+                end
+            }
+        end
+        local function addOptRow(opts, activeIdx)
+            lo=lo+1
+            local row=mk2("Frame",frame,{LayoutOrder=lo,Size=UDim2.new(1,0,0,BH2+6),BackgroundTransparency=1,BorderSizePixel=0})
+            mk2("UIPadding",row,{PaddingLeft=UDim.new(0,5),PaddingRight=UDim.new(0,5),PaddingTop=UDim.new(0,3),PaddingBottom=UDim.new(0,3)})
+            mk2("UIListLayout",row,{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,4),
+                SortOrder=Enum.SortOrder.LayoutOrder,VerticalAlignment=Enum.VerticalAlignment.Center})
+            local btns2={}
+            for i,opt in ipairs(opts) do
+                local b=mk2("TextButton",row,{LayoutOrder=i,Size=UDim2.new(1/#opts,-4*(#opts-1)/#opts,1,0),
+                    BackgroundColor3=(i==activeIdx) and BON or BOFF,BorderSizePixel=0,
+                    Text=tostring(opt),Font=FB2,TextSize=11,TextColor3=TXT,AutoButtonColor=false})
+                c2(b,6); btns2[i]=b
+                b.MouseButton1Click:Connect(function()
+                    for _,bb in ipairs(btns2) do paint2(bb,false) end; paint2(b,true)
+                end)
+            end
+        end
+        -- grip is now in hdr2 top-right (see above)
+        return frame,addDiv,addPad,addToggle,addBtn,addBtnSm,addSetting,addOptRow,sg2
+    end
+    -- ── NEEGY TELEPORT panel ──────────────────────────────────────────────────
+    do
+        local frame,addDiv,addPad,addToggle,addBtn,addBtnSm,addSetting,addOptRow,sg2 =
+            mkPanel2("NeegyPriv","neegy priv tp",PW,20,60)
+        UIS2.InputBegan:Connect(function(i,gp)
+            if gp then return end
+            if i.KeyCode == Enum.KeyCode.LeftControl or i.KeyCode == Enum.KeyCode.RightControl then
+                sg2.Enabled = not sg2.Enabled
+            end
+        end)
+        addPad(2)
+        -- AUTO TP
+        local atState = addToggle("auto tp: " .. ((_G.TacoAutoTP~=false) and "on" or "off"), _G.TacoAutoTP~=false)
+        atState.onChange = function(on) _G.TacoAutoTP = on; saveTpSettings() end
+        _G.TacoRepaintAutoTP = function()
+            local on = _G.TacoAutoTP ~= false
+            atState.on = on; paint2(atState.btn,on)
+            atState.btn.Text = on and "auto tp: on" or "auto tp: off"
+        end
+        addDiv()
+        -- MANUAL TP
+        local manBtn = addBtn("manual tp")
+        manBtn.MouseButton1Click:Connect(function()
+            task.spawn(function()
+                if diag() == 0 then return end
+                if _G.TacoStartSideTP then pcall(_G.TacoStartSideTP)
+                else pcall(doVelocityTP, true) end
+            end)
+        end)
+        addDiv()
+        -- PRIORITY / NEAREST steal mode buttons
+        local prioBtn = nil; local nearBtn2 = nil
+        local function refreshStealBtns()
+            local mode = _G.TacoStealMode
+            if prioBtn  then paint2(prioBtn,  mode=="priority"); prioBtn.Text  = mode=="priority" and "priority: on"  or "priority: off"  end
+            if nearBtn2 then paint2(nearBtn2, mode=="nearest");  nearBtn2.Text = mode=="nearest"  and "nearest: on"   or "nearest: off"   end
+        end
+        _G.TacoRefreshStealBtns = refreshStealBtns
+        prioBtn = addBtn("priority: " .. (_G.TacoStealMode=="priority" and "on" or "off"), _G.TacoStealMode=="priority" and BON or BOFF)
+        prioBtn.MouseButton1Click:Connect(function()
+            _G.TacoStealMode = (_G.TacoStealMode=="priority") and nil or "priority"
+            stealOn = _G.TacoStealMode ~= nil; saveTpSettings(); refreshStealBtns()
+        end)
+        nearBtn2 = addBtn("nearest: " .. (_G.TacoStealMode=="nearest" and "on" or "off"), _G.TacoStealMode=="nearest" and BON or BOFF)
+        nearBtn2.MouseButton1Click:Connect(function()
+            _G.TacoStealMode = (_G.TacoStealMode=="nearest") and nil or "nearest"
+            stealOn = _G.TacoStealMode ~= nil; saveTpSettings(); refreshStealBtns()
+            if stealOn and _G.TacoStartSideTP then
+                task.spawn(function() pcall(_G.TacoStartSideTP) end)
+            end
+        end)
+        refreshStealBtns()
+        addDiv()
+        -- AUTO BUY
+        local abState = addToggle("auto buy: " .. (_G.TacoAutoBuy and "on" or "off"), _G.TacoAutoBuy)
+        abState.onChange = function(on) _G.TacoAutoBuy = on; abState.btn.Text = on and "auto buy: on" or "auto buy: off"; saveTpSettings() end
+        addDiv()
+        -- AUTO KICK
+        local akState = addToggle("auto kick: " .. ((_G.TacoAutoKickOnSteal == true) and "on" or "off"),
+            _G.TacoAutoKickOnSteal == true)
+        akState.onChange = function(on) _G.TacoAutoKickOnSteal = on; saveTpSettings() end
+        _G.TacoRepaintAutoKick = function()
+            local on = _G.TacoAutoKickOnSteal == true
+            akState.on = on; paint2(akState.btn, on)
+            akState.btn.Text = on and "auto kick: on" or "auto kick: off"
+        end
+        addDiv()
+        -- TP SETTINGS button → opens floating settings popup
+        local tpSetBtn = addBtn("tp settings")
+        local tpSetSg = nil
+        local function closeTpSettings()
+            if tpSetSg then pcall(function() tpSetSg:Destroy() end); tpSetSg = nil end
+        end
+        tpSetBtn.MouseButton1Click:Connect(function()
+            if tpSetSg then closeTpSettings(); return end
+            -- build popup
+            tpSetSg = mk2("ScreenGui", nil, { Name = "NeegyTpSettings", ResetOnSpawn = false,
+                IgnoreGuiInset = true, DisplayOrder = 1000001,
+                ZIndexBehavior = Enum.ZIndexBehavior.Sibling })
+            pcall(function() tpSetSg.Parent = guiParent end)
+            if not tpSetSg.Parent then tpSetSg.Parent = PG end
+            local ap = frame.AbsolutePosition
+            local aw = frame.AbsoluteSize.X
+            local pop = mk2("Frame", tpSetSg, { BackgroundColor3 = BG, BorderSizePixel = 0,
+                Size = UDim2.fromOffset(PW, 10), AutomaticSize = Enum.AutomaticSize.Y,
+                Position = UDim2.fromOffset(ap.X + aw + 6, ap.Y),
+                ClipsDescendants = false })
+            c2(pop, 10)
+            mk2("UIStroke", pop, { Color = P_ON, Thickness = 1, Transparency = 0.55 })
+            local popList = mk2("UIListLayout", pop, { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0,0) })
+            -- header
+            local ph = mk2("Frame", pop, { LayoutOrder = 0, Size = UDim2.new(1,0,0,30),
+                BackgroundColor3 = Color3.fromRGB(18,16,28), BorderSizePixel = 0 })
+            c2(ph, 10)
+            mk2("UIGradient", ph, { Rotation=90, Color=ColorSequence.new(Color3.fromRGB(24,18,40),Color3.fromRGB(18,16,28)) })
+            mk2("TextLabel", ph, { Size=UDim2.new(1,-30,1,0), BackgroundTransparency=1,
+                Text="tp settings", Font=FBK2, TextSize=12, TextColor3=P_TXT,
+                TextXAlignment=Enum.TextXAlignment.Center })
+            local closeBtn = mk2("TextButton", ph, { AnchorPoint=Vector2.new(1,0.5),
+                Position=UDim2.new(1,-6,0.5,0), Size=UDim2.fromOffset(20,20),
+                BackgroundColor3=BOFF, BorderSizePixel=0, Text="✕",
+                Font=FBK2, TextSize=11, TextColor3=DIM, AutoButtonColor=false })
+            c2(closeBtn, 4)
+            closeBtn.MouseButton1Click:Connect(closeTpSettings)
+            local plo = 0
+            local function pDiv()
+                plo=plo+1; mk2("Frame",pop,{LayoutOrder=plo,Size=UDim2.new(1,0,0,1),BackgroundColor3=BDIV,BorderSizePixel=0})
+            end
+            local function pPad(h)
+                plo=plo+1; mk2("Frame",pop,{LayoutOrder=plo,Size=UDim2.new(1,0,0,h),BackgroundTransparency=1,BorderSizePixel=0})
+            end
+            local function pSetting(labelTxt, initVal, step2, minV, maxV, fmt2, onSet2)
+                plo=plo+1
+                local row=mk2("Frame",pop,{LayoutOrder=plo,Size=UDim2.new(1,0,0,22),BackgroundTransparency=1,BorderSizePixel=0})
+                mk2("UIPadding",row,{PaddingLeft=UDim.new(0,7),PaddingRight=UDim.new(0,7),PaddingTop=UDim.new(0,3),PaddingBottom=UDim.new(0,3)})
+                local lbl=mk2("TextLabel",row,{Size=UDim2.new(1,-52,1,0),BackgroundTransparency=1,
+                    Font=FB2,TextSize=10,TextColor3=DIM,TextXAlignment=Enum.TextXAlignment.Left})
+                local val2=initVal
+                local function fmtV(v) return labelTxt..": "..(fmt2 and string.format(fmt2,v) or tostring(v)) end
+                lbl.Text=fmtV(val2)
+                local bRow=mk2("Frame",row,{Size=UDim2.fromOffset(48,16),Position=UDim2.new(1,-48,0.5,-8),BackgroundTransparency=1,BorderSizePixel=0})
+                mk2("UIListLayout",bRow,{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,2),VerticalAlignment=Enum.VerticalAlignment.Center})
+                local function mkPM(t)
+                    local b=mk2("TextButton",bRow,{Size=UDim2.fromOffset(23,16),BackgroundColor3=SM,BorderSizePixel=0,
+                        Text=t,Font=FBK2,TextSize=12,TextColor3=TXT,AutoButtonColor=false})
+                    c2(b,4); return b
+                end
+                mkPM("-").MouseButton1Click:Connect(function() val2=math.max(minV,val2-step2); lbl.Text=fmtV(val2); if onSet2 then onSet2(val2) end end)
+                mkPM("+").MouseButton1Click:Connect(function() val2=math.min(maxV,val2+step2); lbl.Text=fmtV(val2); if onSet2 then onSet2(val2) end end)
+            end
+            local function pBtn(text, bg2)
+                plo=plo+1
+                local row=mk2("Frame",pop,{LayoutOrder=plo,Size=UDim2.new(1,0,0,BH2+6),BackgroundTransparency=1,BorderSizePixel=0})
+                mk2("UIPadding",row,{PaddingLeft=UDim.new(0,5),PaddingRight=UDim.new(0,5),PaddingTop=UDim.new(0,3),PaddingBottom=UDim.new(0,3)})
+                local b=mk2("TextButton",row,{Size=UDim2.new(1,0,1,0),BackgroundColor3=bg2 or BOFF,
+                    BorderSizePixel=0,Text=text,Font=FB2,TextSize=11,TextColor3=TXT,AutoButtonColor=false})
+                c2(b,6); return b
+            end
+            pPad(2)
+            pSetting("TP Velocity",   tonumber(_G.NeegyCruise)    or 400, 5,   200, 750,  "%d",  function(v) _G.NeegyCruise=v;       saveTpSettings() end)
+            pSetting("Climb Speed",   tonumber(_G.TacoClimb)     or 175, 5,   100, 250,  "%d",  function(v) _G.TacoClimb=v;        saveTpSettings() end)
+            pSetting("Go Speed",      tonumber(_G.TacoGoSpeed)   or 230, 5,   80,  600,  "%d",  function(v) _G.TacoGoSpeed=v;      saveTpSettings() end)
+            pSetting("Walk Speed",    tonumber(_G.TacoWalkSpeed) or 20,  1,   16,  29,   "%d",  function(v) _G.TacoWalkSpeed=v;    saveTpSettings() end)
+            pSetting("Landing Delay", tonumber(_G.LandingDelay)  or 0.35,0.05,0.05,0.75, "%.2f",function(v) _G.LandingDelay=v;    saveTpSettings() end)
+            pSetting("Close Speed",   tonumber(_G.TacoCloseSpeed)or 80,  5,   20,  400,  "%d",  function(v) _G.TacoCloseSpeed=v;   saveTpSettings() end)
+            pSetting("Invis Depth",   tonumber(_G.TacoInvisDepth)or 5,   0.5, 0,   10,   "%.1f",function(v) _G.TacoInvisDepth=v;  saveTpSettings() end)
+            pSetting("Invis Angle",   tonumber(_G.TacoInvisAngle)or 180, 5,   0,   360,  "%d",  function(v) _G.TacoInvisAngle=v;  saveTpSettings() end)
+            pDiv()
+            -- GEAR picker inside TP Settings
+            do
+                local GEARS = { "Flying Carpet", "Witch's Broom", "Waverider", "Santa's Sleigh", "Cupid's Wings" }
+                local function curGear()
+                    local n = _G.TacoCarpetTool
+                    return (type(n)=="string" and n~="") and n or "Auto"
+                end
+                local function owns(n)
+                    local plr=game:GetService("Players").LocalPlayer
+                    local ch,bp=plr.Character,plr:FindFirstChild("Backpack")
+                    local t=(ch and ch:FindFirstChild(n)) or (bp and bp:FindFirstChild(n))
+                    return t~=nil and t:IsA("Tool")
+                end
+                local gearBtn = pBtn("GEAR: " .. curGear())
+                local pickSg2 = nil
+                local function closePicker2()
+                    if pickSg2 then pcall(function() pickSg2:Destroy() end); pickSg2=nil end
+                end
+                local function openPicker2()
+                    closePicker2()
+                    pickSg2 = mk2("ScreenGui",nil,{Name="NeegyGearPick",ResetOnSpawn=false,
+                        IgnoreGuiInset=true,DisplayOrder=1000002,ZIndexBehavior=Enum.ZIndexBehavior.Sibling})
+                    pcall(function() pickSg2.Parent = guiParent end)
+                    if not pickSg2.Parent then pickSg2.Parent = PG end
+                    local a = gearBtn.AbsolutePosition
+                    local box = mk2("Frame",pickSg2,{BackgroundColor3=BG,BorderSizePixel=0,
+                        Size=UDim2.fromOffset(PW,10),AutomaticSize=Enum.AutomaticSize.Y,
+                        Position=UDim2.fromOffset(a.X,a.Y+26)})
+                    c2(box,10)
+                    mk2("UIStroke",box,{Color=P_ON,Thickness=1,Transparency=0.55})
+                    mk2("UIListLayout",box,{SortOrder=Enum.SortOrder.LayoutOrder,Padding=UDim.new(0,0)})
+                    local gpH=mk2("Frame",box,{LayoutOrder=0,Size=UDim2.new(1,0,0,26),BackgroundColor3=Color3.fromRGB(18,16,28),BorderSizePixel=0})
+                    c2(gpH,10)
+                    mk2("TextLabel",gpH,{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,
+                        Text="select gear",Font=FBK2,TextSize=11,TextColor3=P_TXT,TextXAlignment=Enum.TextXAlignment.Center})
+                    local ord2=1
+                    local function pickRow(name,isAuto)
+                        ord2=ord2+1
+                        local row=mk2("Frame",box,{LayoutOrder=ord2,Size=UDim2.new(1,0,0,BH2+6),BackgroundTransparency=1,BorderSizePixel=0})
+                        mk2("UIPadding",row,{PaddingLeft=UDim.new(0,5),PaddingRight=UDim.new(0,5),PaddingTop=UDim.new(0,3),PaddingBottom=UDim.new(0,3)})
+                        local sel=(isAuto and curGear()=="Auto") or (not isAuto and curGear()==name)
+                        local have=isAuto or owns(name)
+                        local b=mk2("TextButton",row,{Size=UDim2.new(1,0,1,0),BackgroundColor3=sel and BON or BOFF,BorderSizePixel=0,
+                            Text=(have and "" or "\u{2716} ")..name,Font=FB2,TextSize=11,
+                            TextColor3=sel and BG or (have and TXT or DIM),AutoButtonColor=false})
+                        c2(b,6)
+                        b.MouseButton1Click:Connect(function()
+                            if isAuto then _G.TacoCarpetTool=nil
+                            elseif _G.TacoSetCarpetTool then pcall(_G.TacoSetCarpetTool,name)
+                            else _G.TacoCarpetTool=name end
+                            saveTpSettings(); gearBtn.Text="gear: "..curGear(); closePicker2()
+                        end)
+                    end
+                    pickRow("Auto",true)
+                    for _,n in ipairs(GEARS) do pickRow(n,false) end
+                    ord2=ord2+1
+                    local cr=mk2("Frame",box,{LayoutOrder=ord2,Size=UDim2.new(1,0,0,BH2+8),BackgroundTransparency=1,BorderSizePixel=0})
+                    mk2("UIPadding",cr,{PaddingLeft=UDim.new(0,5),PaddingRight=UDim.new(0,5),PaddingTop=UDim.new(0,3),PaddingBottom=UDim.new(0,5)})
+                    local cb=mk2("TextButton",cr,{Size=UDim2.new(1,0,0,BH2),BackgroundColor3=SM,BorderSizePixel=0,
+                        Text="close",Font=FB2,TextSize=11,TextColor3=DIM,AutoButtonColor=false})
+                    c2(cb,6); cb.MouseButton1Click:Connect(closePicker2)
+                end
+                gearBtn.MouseButton1Click:Connect(function()
+                    if pickSg2 then closePicker2() else openPicker2() end
+                end)
+            end
+            pDiv()
+            local rlBtn2 = pBtn("RESET SIZE + POSITION")
+            rlBtn2.MouseButton1Click:Connect(function()
+                if _G.TacoResetUILayout then pcall(_G.TacoResetUILayout) end
+            end)
+            pPad(3)
+        end)
+        addPad(3)
+    end
+    -- ── FACE AWAY panel ───────────────────────────────────────────────────────
+    do
+        local frame,addDiv,addPad,addToggle,addBtn,_,_,_,_ =
+            mkPanel2("NeegyFaceAway","face away",PW,20,340)
+        addPad(2)
+        -- BASE OWNER toggle
+        local boState = addToggle("base owner: " .. ((_G.TacoFaceAwayOwner == true) and "on" or "off"),
+            _G.TacoFaceAwayOwner == true)
+        boState.btn.Font = FBK2
+        boState.onChange = function(on) _G.TacoFaceAwayOwner = on; boState.btn.Text = on and "base owner: on" or "base owner: off"; pcall(saveTpSettings) end
+        addDiv()
+        -- NEAREST toggle
+        local fnState = addToggle("nearest: " .. ((_G.TacoFaceAwayNearest == true) and "on" or "off"),
+            _G.TacoFaceAwayNearest == true)
+        fnState.btn.Font = FBK2
+        fnState.onChange = function(on) _G.TacoFaceAwayNearest = on; fnState.btn.Text = on and "nearest: on" or "nearest: off"; pcall(saveTpSettings) end
+        addDiv()
+        -- FACE AWAY click button: faces away once (BASE OWNER takes priority over NEAREST)
+        local faBtn = addBtn("face away")
+        faBtn.Font = FBK2
+        paint2(faBtn, false)
+        faBtn.MouseButton1Click:Connect(function()
+            if _G.TacoDoFaceAwayOnce then pcall(_G.TacoDoFaceAwayOnce) end
+        end)
+        addPad(3)
+    end
+    -- ── NEEGY INVIS panel ────────────────────────────────────────────────────
+    do
+        local frame,addDiv,addPad,addToggle,_,_,addSetting,_,_ =
+            mkPanel2("NeegyInvis","neegy invis",220,250,60)
+        addPad(2)
+
+        -- INVIS STEAL: single toggle controlling invis on/off, reflects auto-invis state
+        local isState = addToggle("invis steal: " .. ((_G.TacoInvisOn == true) and "on" or "off"),
+            _G.TacoInvisOn == true)
+        isState.btn.Font = FBK2
+        _G.TacoInvisStealRepaint = function(on)
+            local label = on and "invis steal: on" or "invis steal: off"
+            pcall(paint2, isState.btn, on)
+            pcall(function() isState.btn.Text = label end)
+        end
+        isState.onChange = function(on)
+            _G.TacoInvisOn = on
+            if on then
+                if _G.TacoInvisStart then pcall(_G.TacoInvisStart) end
+                if _G.TacoInvisSetAutoOn then pcall(_G.TacoInvisSetAutoOn, true) end
+            else
+                if _G.TacoInvisSetAutoOn then pcall(_G.TacoInvisSetAutoOn, false) end
+                if _G.TacoInvisStop then pcall(_G.TacoInvisStop) end
+            end
+            pcall(saveTpSettings)
+        end
+
+        addDiv()
+        local wsState = addToggle("walkspeed: " .. ((_G.TacoWalkSpeedOn == true) and "on" or "off"),
+            _G.TacoWalkSpeedOn == true)
+        wsState.onChange = function(on)
+            _G.TacoWalkSpeedOn = on
+            wsState.btn.Text = on and "walkspeed: on" or "walkspeed: off"
+            if _G.TacoSetWalkSpeed then pcall(_G.TacoSetWalkSpeed, on and (_G.TacoWalkSpeed or 25) or 16) end
+            pcall(saveTpSettings)
+        end
+        addDiv()
+        local aiState = addToggle("auto invis: " .. ((_G.TacoInvisAuto == true) and "on" or "off"),
+            _G.TacoInvisAuto == true)
+        aiState.onChange = function(on)
+            _G.TacoInvisAuto = on
+            aiState.btn.Text = on and "auto invis: on" or "auto invis: off"
+            pcall(saveTpSettings)
+        end
+        addDiv()
+        local arState = addToggle("auto recover: " .. ((_G.TacoAutoTPOnRespawn == true) and "on" or "off"),
+            _G.TacoAutoTPOnRespawn == true)
+        arState.onChange = function(on)
+            _G.TacoAutoTPOnRespawn = on
+            arState.btn.Text = on and "auto recover: on" or "auto recover: off"
+            pcall(saveTpSettings)
+        end
+        addPad(4)
+        local _rotBtnRepaint = nil
+        local _wsBtnRepaint  = nil
+        local rotHandle = addSetting("rotation", _G.TacoInvisAngle or 180, 5, 0, 360, "%d°",
+            function(v)
+                _G.TacoInvisAngle = v; pcall(saveTpSettings)
+                if _rotBtnRepaint then _rotBtnRepaint(v) end
+            end)
+        addSetting("depth", _G.TacoInvisDepth or 5, 0.5, 0, 20, "%.1f",
+            function(v) _G.TacoInvisDepth = v; pcall(saveTpSettings) end)
+        local wsHandle = addSetting("walkspeed", _G.TacoWalkSpeed or 25, 1, 16, 50, "%d",
+            function(v)
+                _G.TacoWalkSpeed = v
+                if _G.TacoWalkSpeedOn and _G.TacoSetWalkSpeed then pcall(_G.TacoSetWalkSpeed, v) end
+                pcall(saveTpSettings)
+                if _wsBtnRepaint then _wsBtnRepaint(v) end
+            end)
+        -- QUICK ROT / WS BUTTONS — radio-group, stay lit, bidirectional sync
+        local function _mk2BtnPair(loOrd, t1, fn1, t2, fn2)
+            local brow = mk2("Frame", frame, {LayoutOrder=loOrd,
+                Size=UDim2.new(1,0,0,BH2+4), BackgroundTransparency=1, BorderSizePixel=0})
+            mk2("UIPadding", brow, {PaddingLeft=UDim.new(0,5), PaddingRight=UDim.new(0,5),
+                PaddingTop=UDim.new(0,2), PaddingBottom=UDim.new(0,2)})
+            mk2("UIListLayout", brow, {FillDirection=Enum.FillDirection.Horizontal,
+                Padding=UDim.new(0,4), SortOrder=Enum.SortOrder.LayoutOrder,
+                VerticalAlignment=Enum.VerticalAlignment.Center})
+            local bb1 = mk2("TextButton", brow, {LayoutOrder=1, Size=UDim2.new(0.5,-2,1,0),
+                BackgroundColor3=BOFF, BorderSizePixel=0, Text=t1,
+                Font=FB2, TextSize=11, TextColor3=TXT, AutoButtonColor=false})
+            c2(bb1, 6)
+            local bb2 = mk2("TextButton", brow, {LayoutOrder=2, Size=UDim2.new(0.5,-2,1,0),
+                BackgroundColor3=BOFF, BorderSizePixel=0, Text=t2,
+                Font=FB2, TextSize=11, TextColor3=TXT, AutoButtonColor=false})
+            c2(bb2, 6)
+            local function _sel(active, other)
+                paint2(active, true); paint2(other, false)
+            end
+            paint2(bb1, false); paint2(bb2, false)
+            bb1.MouseButton1Click:Connect(function() _sel(bb1, bb2); pcall(fn1) end)
+            bb2.MouseButton1Click:Connect(function() _sel(bb2, bb1); pcall(fn2) end)
+            return bb1, bb2
+        end
+        mk2("Frame", frame, {LayoutOrder=899, Size=UDim2.new(1,0,0,4),
+            BackgroundTransparency=1, BorderSizePixel=0})
+        local rotBtn180, rotBtn220 = _mk2BtnPair(900,
+            "180°", function()
+                _G.TacoInvisAngle = 180
+                local ch = LP.Character; local hrp2 = ch and ch:FindFirstChild("HumanoidRootPart")
+                if hrp2 then hrp2.CFrame = CFrame.new(hrp2.Position)*CFrame.Angles(0,math.rad(180),0) end
+                if rotHandle then rotHandle.setValue(180) end
+                pcall(saveTpSettings)
+            end,
+            "220°", function()
+                _G.TacoInvisAngle = 220
+                local ch = LP.Character; local hrp2 = ch and ch:FindFirstChild("HumanoidRootPart")
+                if hrp2 then hrp2.CFrame = CFrame.new(hrp2.Position)*CFrame.Angles(0,math.rad(220),0) end
+                if rotHandle then rotHandle.setValue(220) end
+                pcall(saveTpSettings)
+            end)
+        local wsBtn20, wsBtn26 = _mk2BtnPair(901,
+            "20", function()
+                _G.TacoWalkSpeed = 20
+                local ch = LP.Character; local hm = ch and ch:FindFirstChildOfClass("Humanoid")
+                if hm then hm.WalkSpeed = 20 end
+                if _G.TacoWalkSpeedOn and _G.TacoSetWalkSpeed then pcall(_G.TacoSetWalkSpeed, 20) end
+                if wsHandle then wsHandle.setValue(20) end
+                pcall(saveTpSettings)
+            end,
+            "26", function()
+                _G.TacoWalkSpeed = 26
+                local ch = LP.Character; local hm = ch and ch:FindFirstChildOfClass("Humanoid")
+                if hm then hm.WalkSpeed = 26 end
+                if _G.TacoWalkSpeedOn and _G.TacoSetWalkSpeed then pcall(_G.TacoSetWalkSpeed, 26) end
+                if wsHandle then wsHandle.setValue(26) end
+                pcall(saveTpSettings)
+            end)
+        -- wire reverse sync: setting +/- → buttons light up to match
+        _rotBtnRepaint = function(v)
+            if rotBtn180 and rotBtn220 then
+                paint2(rotBtn180, v == 180); paint2(rotBtn220, v == 220)
+            end
+        end
+        _wsBtnRepaint = function(v)
+            if wsBtn20 and wsBtn26 then
+                paint2(wsBtn20, v == 20); paint2(wsBtn26, v == 26)
+            end
+        end
+        -- initial repaint so the correct button is lit on panel open
+        _rotBtnRepaint(_G.TacoInvisAngle or 180)
+        _wsBtnRepaint(_G.TacoWalkSpeed or 25)
+        mk2("Frame", frame, {LayoutOrder=902, Size=UDim2.new(1,0,0,5),
+            BackgroundTransparency=1, BorderSizePixel=0})
+    end
+    -- ── DISCORD BANNER ───────────────────────────────────────────────────────
+    do
+        local old2 = guiParent:FindFirstChild("NeegyDiscord"); if old2 then old2:Destroy() end
+        local dSg = mk2("ScreenGui", nil, {Name="NeegyDiscord", ResetOnSpawn=false,
+            IgnoreGuiInset=true, DisplayOrder=999999, ZIndexBehavior=Enum.ZIndexBehavior.Sibling})
+        pcall(function() dSg.Parent = guiParent end)
+        if not dSg.Parent then dSg.Parent = PG end
+        local dFrame = mk2("Frame", dSg, {
+            BackgroundColor3 = Color3.fromRGB(10,9,16),
+            BorderSizePixel  = 0,
+            Size             = UDim2.fromOffset(220, 30),
+            Position         = UDim2.new(0.5, -110, 0, 6),
+            ClipsDescendants = false,
+        })
+        c2(dFrame, 8)
+        mk2("TextLabel", dFrame, {
+            Size                = UDim2.new(1,0,1,0),
+            BackgroundTransparency = 1,
+            Text                = "discord.gg/neegypriv",
+            Font                = FBK2,
+            TextSize            = 14,
+            TextColor3          = P_TXT,
+            TextXAlignment      = Enum.TextXAlignment.Center,
+        })
+        if _G.TacoMakeDraggable then pcall(_G.TacoMakeDraggable, dFrame, "NeegyDiscord") end
+    end
+    end)
+    task.delay(1.5, diag)
+end
+do
+    local RunService = game:GetService("RunService")
+    local Lighting   = game:GetService("Lighting")
+    local RS         = game:GetService("ReplicatedStorage")
+    local LP         = game:GetService("Players").LocalPlayer
+    local RAG_STATES = {
+        [Enum.HumanoidStateType.Physics]     = true,
+        [Enum.HumanoidStateType.Ragdoll]     = true,
+        [Enum.HumanoidStateType.FallingDown] = true,
+        [Enum.HumanoidStateType.GettingUp]   = true,
+    }
+    local KILL = {
+        BallSocketConstraint = true, NoCollisionConstraint = true, HingeConstraint = true,
+        BodyVelocity = true, BodyPosition = true, BodyGyro = true,
+    }
+    local conns, char, hum, hrp, anim, lastVel = {}, nil, nil, nil, nil, Vector3.zero
+    local function ragdolled()
+        return hum ~= nil and RAG_STATES[hum:GetState()] == true
+    end
+    local function cleanup()
+        if not char then return end
+        pcall(function()
+            for _, o in ipairs(char:GetDescendants()) do
+                if KILL[o.ClassName] then o:Destroy()
+                elseif o:IsA("Motor6D") then o.Enabled = true
+                elseif o:IsA("Attachment") and (o.Name == "A" or o.Name == "B") then o:Destroy() end
+            end
+        end)
+        if anim then
+            for _, t in pairs(anim:GetPlayingAnimationTracks()) do
+                local n = t.Animation and t.Animation.Name:lower() or ""
+                if n:find("rag") or n:find("fall") or n:find("hurt") or n:find("down") then t:Stop(0) end
+            end
+        end
+    end
+    local function recover()
+        hum:ChangeState(Enum.HumanoidStateType.Running)
+        cleanup()
+        pcall(function() workspace.CurrentCamera.CameraSubject = hum end)
+        pcall(function()
+            require(LP:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule", 10)):GetControls():Enable()
+        end)
+    end
+    local function bind(c)
+        for _, v in pairs(conns) do pcall(function() v:Disconnect() end) end
+        conns = {}
+        char = c
+        hum  = c:WaitForChild("Humanoid", 10)
+        hrp  = c:WaitForChild("HumanoidRootPart", 10)
+        anim = hum and hum:WaitForChild("Animator", 10)
+        lastVel = Vector3.zero
+        if not hum then return end
+        conns[#conns + 1] = hum.StateChanged:Connect(function()
+            if ragdolled() then recover() end
+        end)
+        conns[#conns + 1] = c.DescendantAdded:Connect(function()
+            if ragdolled() then cleanup() end
+        end)
+        local f = 0
+        conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+            f = f + 1
+            if f < 6 then return end
+            f = 0
+            if not (ragdolled() and hrp) then return end
+            cleanup()
+            local v = hrp.AssemblyLinearVelocity
+            if (v - lastVel).Magnitude > 40 and v.Magnitude > 25 then
+                hrp.AssemblyLinearVelocity = v.Unit * math.min(v.Magnitude, 15)
+            end
+            lastVel = v
+        end)
+    end
+    LP.CharacterAdded:Connect(function(c) pcall(bind, c) end)
+    if LP.Character then pcall(bind, LP.Character) end
+    local BAD = { Blue = true, DiscoEffect = true, BeeBlur = true, ColorCorrection = true }
+    local function nuke(o) if o and o.Parent and BAD[o.Name] then pcall(function() o:Destroy() end) end end
+    local buzz
+    local function muteBuzz()
+        pcall(function()
+            if not (buzz and buzz.Parent) then
+                local ctl = RS:FindFirstChild("Controllers")
+                local item = ctl and ctl:FindFirstChild("ItemController")
+                local bee = item and item:FindFirstChild("BeeLauncherController")
+                local s = bee and bee:FindFirstChild("Buzzing")
+                if s and s:IsA("Sound") then buzz = s end
+            end
+            if buzz then
+                buzz.Volume = 0
+                if buzz.IsPlaying then buzz:Stop() end
+            end
+        end)
+    end
+    task.spawn(function()
+        LP:WaitForChild("PlayerScripts", 8)
+        _G.TacoBootWait()
+        Lighting.DescendantAdded:Connect(nuke)
+        do local n = 0
+            for _, o in ipairs(Lighting:GetDescendants()) do
+                n = n + 1; if n % 150 == 0 then task.wait() end
+                nuke(o)
+            end
+        end
+        muteBuzz()
+        local acc = 0
+        RunService.Heartbeat:Connect(function(dt)
+            local cam = workspace.CurrentCamera
+            if cam and math.abs(cam.FieldOfView - 20) < 0.01 then
+                cam.FieldOfView = tonumber(_G.TacoFOV) or 70
+            end
+            acc = acc + dt
+            if acc >= 0.5 then acc = 0; muteBuzz() end
+        end)
+    end)
+end
+task.spawn(function()
+    -- TARGETS IS INSTANT. It and the steal bar are the two things you need
+    -- on screen the second the hub runs; the control panels come later.
+    local LP3  = game:GetService("Players").LocalPlayer
+    local UIS3 = game:GetService("UserInputService")
+    local TS3  = game:GetService("TweenService")
+    local PG3  = LP3:WaitForChild("PlayerGui",10)
+    -- DARK GOLD palette — obsidian base, gold accent
+    local BG3   = Color3.fromRGB(10,8,18)
+    local HDR3  = Color3.fromRGB(16,14,26)
+    local ROW3  = Color3.fromRGB(14,12,22)
+    local RSEL3 = Color3.fromRGB(22,18,10)
+    local DIV3  = Color3.fromRGB(200,168,75)
+    local BON3  = Color3.fromRGB(200,168,75)
+    local BOFF3 = Color3.fromRGB(22,20,34)
+    local TXT3  = Color3.fromRGB(218,208,182)
+    local DIM3  = Color3.fromRGB(90,82,62)
+    local FB3   = Enum.Font.GothamBold
+    local FBK3  = Enum.Font.GothamBlack
+    local function mk3(cls,parent,props)
+        local o=Instance.new(cls); for k,v in pairs(props or {}) do o[k]=v end; o.Parent=parent; return o
+    end
+    local function c3(o,r) mk3("UICorner",o,{CornerRadius=UDim.new(0,r or 6)}) end
+    local function tw3(o,p) TS3:Create(o,TweenInfo.new(0.12,Enum.EasingStyle.Quint),p):Play() end
+    local host3 = (gethui and gethui()) or game:GetService("CoreGui") or PG3
+    for _,n in ipairs({"NeegyTargets","TacoTargets"}) do
+        pcall(function() local old=host3:FindFirstChild(n); if old then old:Destroy() end end)
+    end
+    local sg3 = mk3("ScreenGui",nil,{Name="NeegyTargets",ResetOnSpawn=false,IgnoreGuiInset=true,
+        DisplayOrder=999998,ZIndexBehavior=Enum.ZIndexBehavior.Sibling})
+    pcall(function() sg3.Parent = host3 end)
+    if not sg3.Parent then sg3.Parent = PG3 end
+    local root3 = mk3("Frame",sg3,{Name="Root",BackgroundColor3=BG3,BackgroundTransparency=0,
+        BorderSizePixel=0,
+        Size=UDim2.fromOffset(280,360),AutomaticSize=Enum.AutomaticSize.None,
+        ClipsDescendants=true,
+        Position=UDim2.fromOffset(tonumber(_G._taco_tgtX) or 410, tonumber(_G._taco_tgtY) or 60)})
+    c3(root3,10)
+    do local st=Instance.new("UIStroke"); st.Color=Color3.fromRGB(48, 44, 64); st.Thickness=1; st.Transparency=0; st.Parent=root3 end
+    if _G.TacoUIRegister then pcall(_G.TacoUIRegister, "NeegyTargets", root3) end
+    if _G.TacoMakeDraggable then pcall(_G.TacoMakeDraggable, root3, "NeegyTargets") end
+    mk3("UIListLayout",root3,{SortOrder=Enum.SortOrder.LayoutOrder,Padding=UDim.new(0,0)})
+    -- (no UIStroke border on STEAL TARGET)
+    -- ── purple-themed header ──────────────────────────────────────────────────
+    local P3_ON  = Color3.fromRGB(200,168,75)
+    local P3_OFF = Color3.fromRGB(22,20,34)
+    local P3_TXT = Color3.fromRGB(218,208,182)
+    local P3_DIM = Color3.fromRGB(90,82,62)
+    local function paint3(b,on)
+        b.BackgroundColor3    = on and P3_ON or P3_OFF
+        b.BackgroundTransparency = 0
+        b.TextColor3          = on and Color3.fromRGB(255,255,255) or P3_DIM
+    end
+    local hdr3 = mk3("Frame",root3,{LayoutOrder=0,Size=UDim2.new(1,0,0,26),
+        BackgroundColor3=HDR3,BackgroundTransparency=0,BorderSizePixel=0})
+    mk3("Frame",hdr3,{Size=UDim2.new(1,0,0,1),
+        AnchorPoint=Vector2.new(0,1),Position=UDim2.new(0,0,1,0),
+        BackgroundColor3=Color3.fromRGB(48, 44, 64),BackgroundTransparency=0,BorderSizePixel=0})
+    -- centered title
+    mk3("TextLabel",hdr3,{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,
+        Text="steal target",Font=FBK3,TextSize=10,TextColor3=DIM3,
+        TextXAlignment=Enum.TextXAlignment.Center})
+    local countLbl = {}
+    -- ⚙ settings button top-right (grey)
+    local tgt3SetBtn = mk3("TextButton",hdr3,{AnchorPoint=Vector2.new(1,0.5),
+        Position=UDim2.new(1,-4,0.5,0),Size=UDim2.fromOffset(20,20),
+        BackgroundTransparency=1,BorderSizePixel=0,
+        Text="⚙",Font=FBK3,TextSize=12,TextColor3=DIM3,AutoButtonColor=false,ZIndex=99})
+    tgt3SetBtn.MouseEnter:Connect(function() tgt3SetBtn.TextColor3=Color3.fromRGB(200,168,75) end)
+    tgt3SetBtn.MouseLeave:Connect(function() tgt3SetBtn.TextColor3=DIM3 end)
+    -- drag (skip when ⚙ is being clicked)
+    do
+        local drag3,ds3,dp3=false,nil,nil
+        hdr3.InputBegan:Connect(function(i)
+            if _G.__TacoSizing then return end
+            if i.UserInputType~=Enum.UserInputType.MouseButton1 and i.UserInputType~=Enum.UserInputType.Touch then return end
+            -- don't drag if pointer is over the settings button
+            local mp=i.Position
+            local bp=tgt3SetBtn.AbsolutePosition; local bs=tgt3SetBtn.AbsoluteSize
+            if mp.X>=bp.X and mp.X<=bp.X+bs.X and mp.Y>=bp.Y and mp.Y<=bp.Y+bs.Y then return end
+            drag3=true; ds3=i.Position; local a=root3.AbsolutePosition; dp3=UDim2.fromOffset(a.X,a.Y); root3.Position=dp3
+        end)
+        UIS3.InputChanged:Connect(function(i)
+            if not drag3 then return end
+            if i.UserInputType~=Enum.UserInputType.MouseMovement and i.UserInputType~=Enum.UserInputType.Touch then return end
+            local d=i.Position-ds3; root3.Position=UDim2.fromOffset(dp3.X.Offset+d.X,dp3.Y.Offset+d.Y)
+        end)
+        UIS3.InputEnded:Connect(function(i)
+            if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+                if drag3 and _G.TacoUIRemember then pcall(_G.TacoUIRemember, "NeegyTargets", root3) end
+                drag3=false; _G._taco_tgtX=root3.Position.X.Offset; _G._taco_tgtY=root3.Position.Y.Offset
+            end
+        end)
+    end
+    -- ── ⚙ settings popup ─────────────────────────────────────────────────────
+    local openPrioEditor  -- assigned later when the prio editor is built
+    local tgt3SetSg = nil
+    local modBtns = {}
+    local function closeTgt3Settings()
+        if tgt3SetSg then pcall(function() tgt3SetSg:Destroy() end); tgt3SetSg=nil end
+    end
+    local function mkPopBtn3(parent, lo, text, on)
+        local row=mk3("Frame",parent,{LayoutOrder=lo,Size=UDim2.new(1,0,0,30),BackgroundTransparency=1,BorderSizePixel=0})
+        mk3("UIPadding",row,{PaddingLeft=UDim.new(0,5),PaddingRight=UDim.new(0,5),PaddingTop=UDim.new(0,2),PaddingBottom=UDim.new(0,2)})
+        local b=mk3("TextButton",row,{Size=UDim2.new(1,0,1,0),BorderSizePixel=0,
+            Text=text,Font=FB3,TextSize=11,AutoButtonColor=false})
+        c3(b,6); paint3(b,on); return b
+    end
+    tgt3SetBtn.MouseButton1Click:Connect(function()
+        if tgt3SetSg then closeTgt3Settings(); return end
+        tgt3SetSg = mk3("ScreenGui",nil,{Name="NeegyTgtSettings",ResetOnSpawn=false,
+            IgnoreGuiInset=true,DisplayOrder=1000002,ZIndexBehavior=Enum.ZIndexBehavior.Sibling})
+        pcall(function() tgt3SetSg.Parent = host3 end)
+        if not tgt3SetSg.Parent then tgt3SetSg.Parent = PG3 end
+        local ap=root3.AbsolutePosition; local aw=root3.AbsoluteSize.X
+        local pop=mk3("Frame",tgt3SetSg,{BackgroundColor3=Color3.fromRGB(10,8,18),
+            BackgroundTransparency=0,BorderSizePixel=0,
+            Size=UDim2.fromOffset(185,10),AutomaticSize=Enum.AutomaticSize.Y,
+            Position=UDim2.fromOffset(ap.X+aw+6,ap.Y),ClipsDescendants=false})
+        c3(pop,8)
+        mk3("UIListLayout",pop,{SortOrder=Enum.SortOrder.LayoutOrder,Padding=UDim.new(0,0)})
+        -- popup header
+        local ph=mk3("Frame",pop,{LayoutOrder=0,Size=UDim2.new(1,0,0,28),
+            BackgroundColor3=Color3.fromRGB(0,0,0),BackgroundTransparency=1,BorderSizePixel=0})
+        mk3("Frame",ph,{Size=UDim2.new(0.3,0,0,1),
+            AnchorPoint=Vector2.new(0.5,1),Position=UDim2.new(0.5,0,1,0),
+            BackgroundColor3=Color3.fromRGB(255,255,255),BackgroundTransparency=0.7,BorderSizePixel=0})
+        mk3("TextLabel",ph,{Size=UDim2.new(1,-28,1,0),BackgroundTransparency=1,
+            Text="settings",Font=FBK3,TextSize=10,TextColor3=DIM3,
+            TextXAlignment=Enum.TextXAlignment.Center})
+        local phClose=mk3("TextButton",ph,{AnchorPoint=Vector2.new(1,0.5),Position=UDim2.new(1,-4,0.5,0),
+            Size=UDim2.fromOffset(20,20),BackgroundTransparency=1,BorderSizePixel=0,
+            Text="✕",Font=FBK3,TextSize=11,TextColor3=DIM3,AutoButtonColor=false,ZIndex=99})
+        c3(phClose,4); phClose.MouseButton1Click:Connect(closeTgt3Settings)
+        local plo=1
+        -- PRIORITY / NEAREST mode toggles
+        local prioPopBtn = mkPopBtn3(pop,plo,"priority: "..((_G.TacoStealMode=="priority") and "on" or "off"),_G.TacoStealMode=="priority"); plo=plo+1
+        modBtns["priority"]=prioPopBtn
+        prioPopBtn.MouseButton1Click:Connect(function()
+            _G.TacoStealMode=(_G.TacoStealMode=="priority") and nil or "priority"
+            stealOn=_G.TacoStealMode~=nil; pcall(saveTpSettings)
+            for m,b in pairs(modBtns) do
+                local on=_G.TacoStealMode==m
+                paint3(b,on); b.Text=(m=="priority" and "priority: " or "nearest: ")..(on and "on" or "off")
+            end
+            if stealOn and _G.TacoStartSideTP then task.spawn(function() pcall(_G.TacoStartSideTP) end) end
+        end)
+        local nearPopBtn = mkPopBtn3(pop,plo,"nearest: "..((_G.TacoStealMode=="nearest") and "on" or "off"),_G.TacoStealMode=="nearest"); plo=plo+1
+        modBtns["nearest"]=nearPopBtn
+        nearPopBtn.MouseButton1Click:Connect(function()
+            _G.TacoStealMode=(_G.TacoStealMode=="nearest") and nil or "nearest"
+            stealOn=_G.TacoStealMode~=nil; pcall(saveTpSettings)
+            for m,b in pairs(modBtns) do
+                local on=_G.TacoStealMode==m
+                paint3(b,on); b.Text=(m=="priority" and "priority: " or "nearest: ")..(on and "on" or "off")
+            end
+            if stealOn and _G.TacoStartSideTP then task.spawn(function() pcall(_G.TacoStartSideTP) end) end
+        end)
+        -- divider
+        mk3("Frame",pop,{LayoutOrder=plo,Size=UDim2.new(1,0,0,1),BackgroundColor3=P3_ON,BorderSizePixel=0,BackgroundTransparency=0.7}); plo=plo+1
+        -- CHANGE PRIO
+        local chgPrioPopBtn = mkPopBtn3(pop,plo,"change prio",false); plo=plo+1
+        chgPrioPopBtn.TextColor3=P3_TXT
+        chgPrioPopBtn.MouseButton1Click:Connect(function() closeTgt3Settings(); if openPrioEditor then openPrioEditor() end end)
+        -- IMPORT / EXPORT
+        local impRow=mk3("Frame",pop,{LayoutOrder=plo,Size=UDim2.new(1,0,0,30),BackgroundTransparency=1,BorderSizePixel=0})
+        mk3("UIPadding",impRow,{PaddingLeft=UDim.new(0,5),PaddingRight=UDim.new(0,5),PaddingTop=UDim.new(0,2),PaddingBottom=UDim.new(0,2)})
+        mk3("UIListLayout",impRow,{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,4),
+            SortOrder=Enum.SortOrder.LayoutOrder,VerticalAlignment=Enum.VerticalAlignment.Center})
+        plo=plo+1
+        local impBtn=mk3("TextButton",impRow,{LayoutOrder=1,Size=UDim2.new(0.5,-4,1,0),
+            BackgroundColor3=P3_OFF,BorderSizePixel=0,Text="import",
+            Font=FB3,TextSize=11,TextColor3=P3_DIM,AutoButtonColor=false})
+        c3(impBtn,6)
+        impBtn.MouseButton1Click:Connect(function()
+            closeTgt3Settings()
+            if _G.TacoImportPrio then pcall(_G.TacoImportPrio)
+            elseif _G.TacoImport then pcall(_G.TacoImport) end
+        end)
+        local expBtn=mk3("TextButton",impRow,{LayoutOrder=2,Size=UDim2.new(0.5,-4,1,0),
+            BackgroundColor3=P3_OFF,BorderSizePixel=0,Text="export",
+            Font=FB3,TextSize=11,TextColor3=P3_DIM,AutoButtonColor=false})
+        c3(expBtn,6)
+        expBtn.MouseButton1Click:Connect(function()
+            closeTgt3Settings()
+            if _G.TacoExportPrio then pcall(_G.TacoExportPrio)
+            elseif _G.TacoExport then pcall(_G.TacoExport) end
+        end)
+        mk3("Frame",pop,{LayoutOrder=plo,Size=UDim2.new(1,0,0,4),BackgroundTransparency=1,BorderSizePixel=0})
+    end)
+    -- ── pet list scroll (fills remaining panel space) ─────────────────────────
+    local scroll3 = mk3("ScrollingFrame",root3,{LayoutOrder=1,
+        Size=UDim2.new(1,0,1,-34),BackgroundTransparency=1,BorderSizePixel=0,
+        ScrollBarThickness=2,ScrollBarImageColor3=Color3.fromRGB(200,195,180),
+        CanvasSize=UDim2.new(),AutomaticCanvasSize=Enum.AutomaticSize.Y})
+    mk3("UIListLayout",scroll3,{Padding=UDim.new(0,3),SortOrder=Enum.SortOrder.LayoutOrder})
+    mk3("UIPadding",scroll3,{PaddingLeft=UDim.new(0,4),PaddingRight=UDim.new(0,4),
+        PaddingTop=UDim.new(0,4),PaddingBottom=UDim.new(0,4)})
+    mk3("Frame",root3,{LayoutOrder=5,Size=UDim2.new(1,0,0,4),BackgroundTransparency=1,BorderSizePixel=0})
+    local function short3(n)
+        n=tonumber(n) or 0
+        if n>=1e9 then return string.format("%.1fB",n/1e9) end
+        if n>=1e6 then return string.format("%.1fM",n/1e6) end
+        if n>=1e3 then return string.format("%.1fK",n/1e3) end
+        return string.format("%d",n)
+    end
+    -- rarity colours for sub-line mutation label (RichText hex) — real in-game names
+    local MUT3 = {
+        ["Gold"]         = "#D6A436",
+        ["Diamond"]      = "#67E8F9",
+        ["Rainbow"]      = "#F472B6",
+        ["Bloodrot"]     = "#F87171",
+        ["Candy"]        = "#FB7185",
+        ["Lava"]         = "#FF6B35",
+        ["Galaxy"]       = "#818CF8",
+        ["Yin Yang"]     = "#E2E8F0",
+        ["Radioactive"]  = "#4ADE80",
+        ["Cursed"]       = "#A855F7",
+        ["Divine"]       = "#C084FC",
+        ["Cyber"]        = "#22D3EE",
+        ["Phantom"]      = "#94A3B8",
+        ["Crystal"]      = "#BAE6FD",
+    }
+    local rows3 = {}
+    local function rowFor3(uid)
+        local r=rows3[uid]
+        if r and r.card.Parent then return r end
+        -- card (no border stroke — clean flat rows)
+        local card=mk3("Frame",scroll3,{Size=UDim2.new(1,-2,0,44),BackgroundColor3=ROW3,
+            BackgroundTransparency=0,BorderSizePixel=0,Active=true})
+        c3(card,6)
+        -- gold left accent bar (visible only when selected)
+        local accent=mk3("Frame",card,{Size=UDim2.new(0,3,1,0),BackgroundColor3=Color3.fromRGB(200,168,75),
+            BackgroundTransparency=1,BorderSizePixel=0,ZIndex=2})
+        -- rank badge column (#1 gold, others dim)
+        local rankLbl=mk3("TextLabel",card,{
+            Position=UDim2.fromOffset(0,0),Size=UDim2.fromOffset(34,44),
+            BackgroundTransparency=1,Font=FBK3,TextSize=11,TextColor3=DIM3,
+            TextXAlignment=Enum.TextXAlignment.Center,TextYAlignment=Enum.TextYAlignment.Center,
+            Text="#?"})
+        -- pet name
+        local nm=mk3("TextLabel",card,{Position=UDim2.fromOffset(34,6),Size=UDim2.new(1,-38,0,16),
+            BackgroundTransparency=1,Font=FBK3,TextSize=12,TextColor3=TXT3,
+            TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd,Text=""})
+        -- mps · mutation sub-line (RichText so mutation can be gold)
+        local sub=mk3("TextLabel",card,{Position=UDim2.fromOffset(34,23),Size=UDim2.new(1,-38,0,12),
+            BackgroundTransparency=1,Font=Enum.Font.Gotham,TextSize=10,TextColor3=DIM3,
+            TextXAlignment=Enum.TextXAlignment.Left,RichText=true,Text=""})
+        -- invisible hit target on top
+        local hit=mk3("TextButton",card,{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,
+            Text="",AutoButtonColor=false,Active=true,ZIndex=3})
+        r={card=card,accent=accent,rankLbl=rankLbl,name=nm,sub=sub,hit=hit,lastLocked=false,lastRank=0}
+        rows3[uid]=r
+        return r
+    end
+    task.spawn(function()
+        task.wait(tonumber(_G.TacoPanelStartDelay) or 0.25)
+        while sg3.Parent do
+            local ok,pets = pcall(neegyRailScan)
+            if ok and type(pets)=="table" then
+                local seen={}
+                for i,p in ipairs(pets) do
+                    if not p.conveyor then
+                        local uid=_petUid(p)
+                        seen[uid]=true
+                        local r=rowFor3(uid)
+                        r.pet=p; r.card.LayoutOrder=i
+                        local _pname = tostring(p.name or "?")
+                        r.name.Text = _pname
+                        local mut=tostring(p.mutation or "")
+                        -- sub: mps dim, mutation in its rarity colour
+                        if mut~="" then
+                            local mc = MUT3[mut] or "#7A7682"
+                            r.sub.Text=short3(p.mps or 0).."/s  <font color=\""..mc.."\">"..mut.."</font>"
+                        else
+                            r.sub.Text=short3(p.mps or 0).."/s"
+                        end
+                        -- rank badge — grey
+                        if r.lastRank~=i then
+                            r.lastRank=i
+                            r.rankLbl.Text="#"..i
+                            r.rankLbl.TextColor3=Color3.fromRGB(110,108,116)
+                            r.rankLbl.Font=FBK3
+                        end
+                        local locked=(_G.TacoStealTargetUID==uid)
+                        if locked~=r.lastLocked then
+                            r.lastLocked=locked
+                            -- gold accent bar on selected, warm tint bg, dark text stays
+                            tw3(r.accent,{BackgroundTransparency=locked and 0 or 1})
+                            tw3(r.card,{BackgroundColor3=locked and RSEL3 or ROW3})
+                            r.name.TextColor3 = TXT3
+                            r.rankLbl.TextColor3 = locked and Color3.fromRGB(200,168,75) or DIM3
+                        end
+                        if not r.wired then
+                            r.wired=true
+                            local myUid=uid; local crow=r
+                            r.hit.MouseButton1Click:Connect(function()
+                                if _G.TacoStealTargetUID==myUid then
+                                    _G.TacoStealTargetUID=nil; _G.TacoStealTarget=nil
+                                else
+                                    _G.TacoStealTargetUID=myUid
+                                    local pet=crow.pet
+                                    pcall(function()
+                                        local ok2,fresh=pcall(neegyRailScan)
+                                        if ok2 and fresh then
+                                            for _,fp in ipairs(fresh) do
+                                                if _petUid(fp)==myUid then pet=fp; break end
+                                            end
+                                        end
+                                    end)
+                                    if pet and pet.position and not isTeleporting and not _G.TacoClickTPBusy then
+                                        pcall(function()
+                                            if _ctpAllowed and not _ctpAllowed(pet) then return end
+                                            _G.TacoClickTPBusy=true; isTeleporting=true; _G.TacoTPActive=true
+                                            task.spawn(function()
+                                                pcall(function() goToBrainrot(pet.position,pet.slot) end)
+                                                isTeleporting=false; _G.TacoTPActive=false; _G.TacoClickTPBusy=false
+                                            end)
+                                        end)
+                                    end
+                                end
+                            end)
+                            r.hit.MouseEnter:Connect(function()
+                                if _G.TacoStealTargetUID~=myUid then
+                                    tw3(r.card,{BackgroundColor3=Color3.fromRGB(250,248,242)})
+                                end
+                            end)
+                            r.hit.MouseLeave:Connect(function()
+                                if _G.TacoStealTargetUID~=myUid then
+                                    tw3(r.card,{BackgroundColor3=ROW3})
+                                end
+                            end)
+                        end
+                    end
+                end
+                -- PUBLISH THE EXACT TOP ROW. This is literally what you see as
+                -- row #1 in TARGETS. doVelocityTP flies to THIS pet, so the TP can
+                -- never disagree with the panel again.
+                do
+                    local _top=nil
+                    for _,p in ipairs(pets) do if not p.conveyor then _top=p break end end
+                    _G.TacoPanelTopPet = _top
+                    _G.TacoPanelTopUid = _top and _petUid(_top) or nil
+                    _G.TacoPanelTopAt  = os.clock()
+                    _G.TacoPanelTopFull = (tonumber(_G.TacoScanNoChan) or 0) == 0
+                end
+                local n=0
+                for uid,r in pairs(rows3) do
+                    if seen[uid] then n=n+1
+                    else r.card:Destroy(); rows3[uid]=nil end
+                end
+                countLbl.Text=tostring(n)
+                for m,btn in pairs(modBtns) do pcall(paint3,btn,_G.TacoStealMode==m) end
+            end
+            -- DEBLOAT: the panel re-ranks ~10x/s. While a teleport is flying,
+            -- back off to a slower cadence so the flight loop gets the CPU (the
+            -- panel is not what you're watching mid-TP). _G.TacoPanelTPGap sets
+            -- the flying rate; TacoPanelPauseOnTP=false keeps the full rate.
+            if _G.TacoTPActive and _G.TacoPanelPauseOnTP ~= false then
+                task.wait(tonumber(_G.TacoPanelTPGap) or 0.25)
+            else
+                task.wait(tonumber(_G.TacoPanelScanGap) or 0.05)
+            end
+        end
+    end)
+    -- ================================================================
+    -- CHANGE PRIO editor. Browse every brainrot, toggle membership in
+    -- _G.SHARED_PRIORITY_ITEMS (the same ordered table the ranker reads),
+    -- and reorder priority entries. Every mutation bumps TacoPriVersion
+    -- and calls saveTpSettings so the change persists and the ranker
+    -- rebuilds. Built as a free-positioned overlay parented to sg3 (which
+    -- has no UIListLayout) so it does not disturb root3's stacked layout.
+    -- ================================================================
+    do
+        local PRIO_FILE = "TacoPrioList.json"
+
+        local ed = mk3("Frame",sg3,{Name="PrioEditor",Visible=false,BackgroundColor3=BG3,
+            BorderSizePixel=0,ZIndex=50,ClipsDescendants=true,
+            Size=root3.Size,Position=root3.Position})
+        c3(ed,10)
+        mk3("UIStroke",ed,{Color=BON3,Thickness=1,Transparency=0.4})
+
+        -- ── header bar ──────────────────────────────────────────────
+        local eHdr = mk3("Frame",ed,{Size=UDim2.new(1,0,0,26),BackgroundColor3=HDR3,BorderSizePixel=0,ZIndex=51})
+        c3(eHdr,10)
+        -- gradient
+        local eHdrGrad = Instance.new("UIGradient")
+        eHdrGrad.Rotation = 90
+        eHdrGrad.Color = ColorSequence.new(HDR3, HDR3)
+        eHdrGrad.Parent = eHdr
+        -- gold bottom line
+        mk3("Frame",eHdr,{AnchorPoint=Vector2.new(0,1),Position=UDim2.new(0,0,1,0),
+            Size=UDim2.new(1,0,0,1),BackgroundColor3=BON3,BorderSizePixel=0,ZIndex=53})
+        mk3("TextLabel",eHdr,{Size=UDim2.new(1,-90,1,0),Position=UDim2.fromOffset(10,0),
+            BackgroundTransparency=1,Text="priority list",Font=FBK3,TextSize=11,TextColor3=BON3,
+            TextXAlignment=Enum.TextXAlignment.Left,ZIndex=52})
+        -- IMPORT button
+        local eImport = mk3("TextButton",eHdr,{AnchorPoint=Vector2.new(1,0.5),
+            Position=UDim2.new(1,-64,0.5,0),Size=UDim2.fromOffset(26,18),
+            BackgroundColor3=BOFF3,BorderSizePixel=0,Text="imp",
+            Font=FBK3,TextSize=9,TextColor3=TXT3,AutoButtonColor=false,ZIndex=52})
+        c3(eImport,4)
+        mk3("UIStroke",eImport,{Color=BON3,Thickness=1,Transparency=0.6})
+        -- EXPORT button
+        local eExport = mk3("TextButton",eHdr,{AnchorPoint=Vector2.new(1,0.5),
+            Position=UDim2.new(1,-34,0.5,0),Size=UDim2.fromOffset(26,18),
+            BackgroundColor3=BOFF3,BorderSizePixel=0,Text="exp",
+            Font=FBK3,TextSize=9,TextColor3=TXT3,AutoButtonColor=false,ZIndex=52})
+        c3(eExport,4)
+        mk3("UIStroke",eExport,{Color=BON3,Thickness=1,Transparency=0.6})
+        -- close button
+        local eClose = mk3("TextButton",eHdr,{AnchorPoint=Vector2.new(1,0.5),Position=UDim2.new(1,-5,0.5,0),
+            Size=UDim2.fromOffset(24,18),BackgroundColor3=BOFF3,BorderSizePixel=0,Text="X",
+            Font=FBK3,TextSize=11,TextColor3=TXT3,AutoButtonColor=false,ZIndex=52})
+        c3(eClose,5)
+
+        -- ── status label (IMP/EXP feedback) ─────────────────────────
+        local eStatus = mk3("TextLabel",ed,{Position=UDim2.fromOffset(6,30),Size=UDim2.new(1,-12,0,16),
+            BackgroundTransparency=1,Text="",Font=Enum.Font.Gotham,TextSize=10,
+            TextColor3=DIM3,TextXAlignment=Enum.TextXAlignment.Left,ZIndex=51})
+        local statusTimer = nil
+        local function showStatus(msg, isOk)
+            eStatus.Text = msg
+            eStatus.TextColor3 = isOk and BON3 or Color3.fromRGB(200,80,80)
+            if statusTimer then task.cancel(statusTimer) end
+            statusTimer = task.delay(3, function() eStatus.Text = "" end)
+        end
+
+        -- ── search box ───────────────────────────────────────────────
+        local eSearch = mk3("TextBox",ed,{Position=UDim2.fromOffset(6,50),Size=UDim2.new(1,-12,0,22),
+            BackgroundColor3=ROW3,BorderSizePixel=0,Text="",PlaceholderText="search…",
+            Font=Enum.Font.Gotham,TextSize=11,TextColor3=TXT3,PlaceholderColor3=DIM3,
+            ClearTextOnFocus=false,TextXAlignment=Enum.TextXAlignment.Left,ZIndex=51})
+        c3(eSearch,5)
+        mk3("UIPadding",eSearch,{PaddingLeft=UDim.new(0,8),PaddingRight=UDim.new(0,8)})
+
+        -- ── add-custom row ───────────────────────────────────────────
+        local addRow = mk3("Frame",ed,{Position=UDim2.fromOffset(6,76),Size=UDim2.new(1,-12,0,22),
+            BackgroundTransparency=1,BorderSizePixel=0,ZIndex=51})
+        local addBox = mk3("TextBox",addRow,{Size=UDim2.new(1,-46,1,0),
+            BackgroundColor3=ROW3,BorderSizePixel=0,Text="",PlaceholderText="add name…",
+            Font=Enum.Font.Gotham,TextSize=11,TextColor3=TXT3,PlaceholderColor3=DIM3,
+            ClearTextOnFocus=false,TextXAlignment=Enum.TextXAlignment.Left,ZIndex=51})
+        c3(addBox,5)
+        mk3("UIPadding",addBox,{PaddingLeft=UDim.new(0,8),PaddingRight=UDim.new(0,8)})
+        local addBtn = mk3("TextButton",addRow,{AnchorPoint=Vector2.new(1,0),Position=UDim2.new(1,0,0,0),
+            Size=UDim2.fromOffset(42,22),BackgroundColor3=BON3,BorderSizePixel=0,Text="add",
+            Font=FBK3,TextSize=10,TextColor3=BG3,AutoButtonColor=false,ZIndex=52})
+        c3(addBtn,5)
+
+        -- ── scrolling list ───────────────────────────────────────────
+        local eScroll = mk3("ScrollingFrame",ed,{Position=UDim2.fromOffset(0,102),Size=UDim2.new(1,0,1,-106),
+            BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=2,
+            ScrollBarImageColor3=Color3.fromRGB(200,195,180),CanvasSize=UDim2.new(),
+            AutomaticCanvasSize=Enum.AutomaticSize.Y,ZIndex=51})
+        mk3("UIListLayout",eScroll,{Padding=UDim.new(0,2),SortOrder=Enum.SortOrder.LayoutOrder})
+        mk3("UIPadding",eScroll,{PaddingLeft=UDim.new(0,4),PaddingRight=UDim.new(0,4),
+            PaddingTop=UDim.new(0,2),PaddingBottom=UDim.new(0,4)})
+
+        -- ── helpers ──────────────────────────────────────────────────
+        local rebuild  -- forward-declared so all closures below capture the same upvalue
+        local rowPool = {}
+        local rebuildScheduled = false
+
+        local function priIndexOf(name)
+            local L = _G.SHARED_PRIORITY_ITEMS
+            if type(L)~="table" then return nil end
+            for i,v in ipairs(L) do if v==name then return i end end
+            return nil
+        end
+        local _phs = game:GetService("HttpService")
+        local function afterEdit()
+            _G.TacoPriVersion = (_G.TacoPriVersion or 0) + 1
+            pcall(saveTpSettings)
+            -- dedicated priority save — independent of the main settings file
+            pcall(function()
+                if writefile then
+                    writefile("NeegyPrio.json", _phs:JSONEncode(_G.SHARED_PRIORITY_ITEMS))
+                end
+            end)
+        end
+
+        -- gather every unique display name from AnimalsData (sorted)
+        local function allBrainrots()
+            local ok = pcall(loadModules)
+            if not ok or type(AnimalsData)~="table" then return nil end
+            local set,out = {},{}
+            pcall(function()
+                for internal,info in pairs(AnimalsData) do
+                    local disp = (type(info)=="table" and info.DisplayName) or internal
+                    disp = tostring(disp)
+                    if disp~="" and not set[disp] then set[disp]=true; out[#out+1]=disp end
+                end
+            end)
+            table.sort(out)
+            return out
+        end
+
+        -- ── export (copy to clipboard) ───────────────────────────────
+        local function doExport()
+            local L = _G.SHARED_PRIORITY_ITEMS
+            if type(L)~="table" or #L==0 then showStatus("✗ list is empty", false); return end
+            local ok, json = pcall(function()
+                local HS2 = game:GetService("HttpService")
+                return HS2:JSONEncode(L)
+            end)
+            if not ok or not json then showStatus("✗ encode failed", false); return end
+            -- copy to clipboard (exploit env provides setclipboard)
+            if setclipboard then
+                pcall(setclipboard, json)
+                showStatus("✓ copied " .. #L .. " items to clipboard", true)
+            elseif writefile then
+                pcall(function() writefile(PRIO_FILE, json) end)
+                showStatus("✓ exported → " .. PRIO_FILE, true)
+            else
+                showStatus("✗ no clipboard or writefile", false)
+            end
+        end
+        eExport.MouseButton1Click:Connect(doExport)
+
+        -- ── import popup (paste JSON directly) ───────────────────────
+        local impPopup = mk3("Frame",ed,{Name="ImportPopup",Visible=false,
+            BackgroundColor3=BG3,BorderSizePixel=0,ZIndex=60,ClipsDescendants=true,
+            Size=UDim2.fromScale(1,1),Position=UDim2.fromOffset(0,0)})
+        c3(impPopup,10)
+        mk3("UIStroke",impPopup,{Color=BON3,Thickness=1,Transparency=0.25})
+        -- popup header
+        local impHdr = mk3("Frame",impPopup,{Size=UDim2.new(1,0,0,26),
+            BackgroundColor3=HDR3,BorderSizePixel=0,ZIndex=61})
+        c3(impHdr,10)
+        do
+            local g = Instance.new("UIGradient"); g.Rotation = 90
+            g.Color = ColorSequence.new(Color3.fromRGB(30,26,16), HDR3); g.Parent = impHdr
+        end
+        mk3("Frame",impHdr,{AnchorPoint=Vector2.new(0,1),Position=UDim2.new(0,0,1,0),
+            Size=UDim2.new(1,0,0,1),BackgroundColor3=BON3,BorderSizePixel=0,ZIndex=63})
+        mk3("TextLabel",impHdr,{Size=UDim2.new(1,-34,1,0),Position=UDim2.fromOffset(10,0),
+            BackgroundTransparency=1,Text="paste config",Font=FBK3,TextSize=11,TextColor3=BON3,
+            TextXAlignment=Enum.TextXAlignment.Left,ZIndex=62})
+        local impClose = mk3("TextButton",impHdr,{AnchorPoint=Vector2.new(1,0.5),
+            Position=UDim2.new(1,-5,0.5,0),Size=UDim2.fromOffset(24,18),
+            BackgroundColor3=BOFF3,BorderSizePixel=0,Text="X",Font=FBK3,TextSize=11,
+            TextColor3=TXT3,AutoButtonColor=false,ZIndex=62})
+        c3(impClose,5)
+        -- hint label
+        mk3("TextLabel",impPopup,{Position=UDim2.fromOffset(8,30),Size=UDim2.new(1,-16,0,16),
+            BackgroundTransparency=1,Text='Paste a JSON array of pet names then hit APPLY',
+            Font=Enum.Font.Gotham,TextSize=10,TextColor3=DIM3,
+            TextXAlignment=Enum.TextXAlignment.Left,ZIndex=61})
+        -- multiline paste box
+        local impBox = mk3("TextBox",impPopup,{Position=UDim2.fromOffset(6,50),
+            Size=UDim2.new(1,-12,1,-84),
+            BackgroundColor3=ROW3,BorderSizePixel=0,MultiLine=true,
+            Text="",PlaceholderText='["pet one","pet two",...]',
+            Font=Enum.Font.Gotham,TextSize=11,TextColor3=TXT3,PlaceholderColor3=DIM3,
+            ClearTextOnFocus=false,TextXAlignment=Enum.TextXAlignment.Left,
+            TextYAlignment=Enum.TextYAlignment.Top,ZIndex=61})
+        c3(impBox,6)
+        mk3("UIPadding",impBox,{PaddingLeft=UDim.new(0,8),PaddingRight=UDim.new(0,8),
+            PaddingTop=UDim.new(0,6),PaddingBottom=UDim.new(0,6)})
+        -- apply button (gold, full-width at bottom)
+        local impApply = mk3("TextButton",impPopup,{AnchorPoint=Vector2.new(0.5,1),
+            Position=UDim2.new(0.5,0,1,-8),Size=UDim2.new(1,-16,0,24),
+            BackgroundColor3=BON3,BorderSizePixel=0,Text="apply",
+            Font=FBK3,TextSize=11,TextColor3=BG3,AutoButtonColor=false,ZIndex=62})
+        c3(impApply,6)
+
+        impClose.MouseButton1Click:Connect(function() impPopup.Visible=false end)
+        eImport.MouseButton1Click:Connect(function()
+            impBox.Text = ""
+            impPopup.Visible = true
+        end)
+        impApply.MouseButton1Click:Connect(function()
+            local raw = tostring(impBox.Text or ""):match("^%s*(.-)%s*$")
+            if raw == "" then
+                showStatus("✗ nothing pasted", false); impPopup.Visible=false; return
+            end
+            local ok, result = pcall(function()
+                local HS2 = game:GetService("HttpService")
+                local decoded = HS2:JSONDecode(raw)
+                if type(decoded)~="table" then error("not array") end
+                local out = {}
+                for _, v in ipairs(decoded) do
+                    if type(v)=="string" and v~="" then out[#out+1]=v end
+                end
+                return out
+            end)
+            if ok and type(result)=="table" and #result>0 then
+                _G.SHARED_PRIORITY_ITEMS = result
+                _G.TacoPanelTopPet = nil    -- wipe stale panel ranking so next TP does a fresh scan
+                _G.TacoPanelTopAt  = nil
+                _G.TacoPanelTopUid = nil
+                afterEdit(); rebuild()
+                impPopup.Visible = false
+                showStatus("✓ imported " .. #result .. " items", true)
+            else
+                showStatus("✗ invalid — paste a plain JSON array of strings", false)
+                impPopup.Visible = false
+            end
+        end)
+
+        -- ── add custom name ───────────────────────────────────────────
+        local function doAddCustom()
+            local name = tostring(addBox.Text or ""):match("^%s*(.-)%s*$")
+            if name=="" then return end
+            local L = _G.SHARED_PRIORITY_ITEMS
+            if type(L)~="table" then L={}; _G.SHARED_PRIORITY_ITEMS=L end
+            if priIndexOf(name) then showStatus("already in list", false); return end
+            table.insert(L, name)
+            afterEdit()
+            addBox.Text = ""
+            rebuild()
+        end
+        addBtn.MouseButton1Click:Connect(doAddCustom)
+        addBox.FocusLost:Connect(function(enterPressed)
+            if enterPressed then doAddCustom() end
+        end)
+
+        -- ── list builder ─────────────────────────────────────────────
+        rebuild = function()
+            local L = _G.SHARED_PRIORITY_ITEMS
+            if type(L)~="table" then L = {}; _G.SHARED_PRIORITY_ITEMS = L end
+            local filter = tostring(eSearch.Text or ""):lower()
+            for _,r in ipairs(rowPool) do r:Destroy() end
+            rowPool = {}
+
+            local all = allBrainrots()
+            -- also include any custom items already on the list that aren't in AnimalsData
+            local allSet = {}
+            if all then for _,nm in ipairs(all) do allSet[nm]=true end end
+            for _,nm in ipairs(L) do
+                if not allSet[nm] then
+                    if not all then all={} end
+                    allSet[nm]=true; all[#all+1]=nm
+                end
+            end
+
+            if not all then
+                local msg = mk3("TextLabel",eScroll,{Size=UDim2.new(1,-4,0,24),LayoutOrder=0,
+                    BackgroundTransparency=1,Text="Loading brainrots…",Font=Enum.Font.Gotham,
+                    TextSize=11,TextColor3=DIM3,ZIndex=52})
+                rowPool[#rowPool+1] = msg
+                task.delay(0.6,function() if ed.Visible then rebuild() end end)
+                return
+            end
+
+            -- ordered: priority first (list order), rest A-Z
+            local inPri = {}
+            for _,nm in ipairs(L) do inPri[nm]=true end
+            local ordered = {}
+            for _,nm in ipairs(L) do ordered[#ordered+1] = nm end
+            local rest = {}
+            for _,nm in ipairs(all) do if not inPri[nm] then rest[#rest+1]=nm end end
+            table.sort(rest)
+            for _,nm in ipairs(rest) do ordered[#ordered+1]=nm end
+
+            local lo = 0
+            for _,nm in ipairs(ordered) do
+                if filter=="" or tostring(nm):lower():find(filter,1,true) then
+                    local rank  = priIndexOf(nm)
+                    local isPri = rank~=nil
+                    lo = lo + 1
+                    local card = mk3("Frame",eScroll,{LayoutOrder=lo,Size=UDim2.new(1,-4,0,26),
+                        BackgroundColor3=isPri and RSEL3 or ROW3,BorderSizePixel=0,ZIndex=51})
+                    c3(card,6)
+                    rowPool[#rowPool+1] = card
+                    -- rank badge / bullet
+                    mk3("TextLabel",card,{Position=UDim2.fromOffset(6,0),Size=UDim2.fromOffset(22,26),
+                        BackgroundTransparency=1,Text=isPri and tostring(rank) or "•",
+                        Font=FB3,TextSize=11,TextColor3=isPri and BON3 or DIM3,
+                        TextXAlignment=Enum.TextXAlignment.Center,ZIndex=53})
+
+                    if isPri then
+                        -- priority row: name label + ✕ delete + ▲▼ reorder
+                        mk3("TextLabel",card,{Position=UDim2.fromOffset(30,0),Size=UDim2.new(1,-96,1,0),
+                            BackgroundTransparency=1,Text=tostring(nm),Font=Enum.Font.Gotham,TextSize=11,
+                            TextColor3=TXT3,TextXAlignment=Enum.TextXAlignment.Left,
+                            TextTruncate=Enum.TextTruncate.AtEnd,ZIndex=53})
+                        -- ▲ move up
+                        local up = mk3("TextButton",card,{AnchorPoint=Vector2.new(1,0.5),
+                            Position=UDim2.new(1,-24,0.5,0),Size=UDim2.fromOffset(16,20),
+                            BackgroundColor3=BOFF3,BorderSizePixel=0,Text="▲",Font=FB3,TextSize=9,
+                            TextColor3=TXT3,AutoButtonColor=false,ZIndex=54})
+                        c3(up,4)
+                        -- ▼ move down
+                        local dn = mk3("TextButton",card,{AnchorPoint=Vector2.new(1,0.5),
+                            Position=UDim2.new(1,-5,0.5,0),Size=UDim2.fromOffset(16,20),
+                            BackgroundColor3=BOFF3,BorderSizePixel=0,Text="▼",Font=FB3,TextSize=9,
+                            TextColor3=TXT3,AutoButtonColor=false,ZIndex=54})
+                        c3(dn,4)
+                        -- ✕ delete from priority list
+                        local delBtn = mk3("TextButton",card,{AnchorPoint=Vector2.new(1,0.5),
+                            Position=UDim2.new(1,-45,0.5,0),Size=UDim2.fromOffset(18,20),
+                            BackgroundColor3=Color3.fromRGB(60,22,22),BorderSizePixel=0,Text="✕",Font=FB3,TextSize=10,
+                            TextColor3=Color3.fromRGB(220,90,90),AutoButtonColor=false,ZIndex=54})
+                        c3(delBtn,4)
+                        mk3("UIStroke",delBtn,{Color=Color3.fromRGB(180,60,60),Thickness=1,Transparency=0.5})
+                        local myName = nm
+                        delBtn.MouseButton1Click:Connect(function()
+                            local i = priIndexOf(myName)
+                            if i then table.remove(_G.SHARED_PRIORITY_ITEMS, i) end
+                            afterEdit(); rebuild()
+                        end)
+                        up.MouseButton1Click:Connect(function()
+                            local i = priIndexOf(myName)
+                            if i and i>1 then
+                                local L2=_G.SHARED_PRIORITY_ITEMS
+                                L2[i],L2[i-1]=L2[i-1],L2[i]
+                                afterEdit(); rebuild()
+                            end
+                        end)
+                        dn.MouseButton1Click:Connect(function()
+                            local L2=_G.SHARED_PRIORITY_ITEMS
+                            local i = priIndexOf(myName)
+                            if i and i<#L2 then
+                                L2[i],L2[i+1]=L2[i+1],L2[i]
+                                afterEdit(); rebuild()
+                            end
+                        end)
+                    else
+                        -- non-priority row: + button to add to list
+                        mk3("TextLabel",card,{Position=UDim2.fromOffset(30,0),Size=UDim2.new(1,-36,1,0),
+                            BackgroundTransparency=1,Text=tostring(nm),Font=Enum.Font.Gotham,TextSize=11,
+                            TextColor3=TXT3,TextXAlignment=Enum.TextXAlignment.Left,
+                            TextTruncate=Enum.TextTruncate.AtEnd,ZIndex=53})
+                        local addPri = mk3("TextButton",card,{AnchorPoint=Vector2.new(1,0.5),
+                            Position=UDim2.new(1,-5,0.5,0),Size=UDim2.fromOffset(24,20),
+                            BackgroundColor3=Color3.fromRGB(22,40,22),BorderSizePixel=0,Text="+",Font=FBK3,TextSize=13,
+                            TextColor3=Color3.fromRGB(90,200,90),AutoButtonColor=false,ZIndex=54})
+                        c3(addPri,4)
+                        mk3("UIStroke",addPri,{Color=Color3.fromRGB(60,160,60),Thickness=1,Transparency=0.5})
+                        local myName = nm
+                        addPri.MouseButton1Click:Connect(function()
+                            local L2 = _G.SHARED_PRIORITY_ITEMS
+                            if type(L2)~="table" then L2={}; _G.SHARED_PRIORITY_ITEMS=L2 end
+                            if not priIndexOf(myName) then
+                                table.insert(L2, myName)
+                                afterEdit(); rebuild()
+                            end
+                        end)
+                    end
+                end
+            end
+        end
+
+        local function scheduleRebuild()
+            if rebuildScheduled then return end
+            rebuildScheduled = true
+            task.delay(0.15,function() rebuildScheduled=false; if ed.Visible then rebuild() end end)
+        end
+        eSearch:GetPropertyChangedSignal("Text"):Connect(scheduleRebuild)
+        eClose.MouseButton1Click:Connect(function() ed.Visible=false end)
+
+        openPrioEditor = function()
+            ed.Size = root3.Size
+            ed.Position = root3.Position
+            ed.Visible = true
+            rebuild()
+        end
+    end
+    -- grip removed
+    _G.TacoToggleTargets = function() sg3.Enabled = not sg3.Enabled end
+end)
+;(function()
+    local Players    = game:GetService("Players")
+    local RunService = game:GetService("RunService")
+    local LP         = Players.LocalPlayer
+    if _G.TacoKickOut == nil then
+        local function psCode(link)
+            link = tostring(link or ""):match("^%s*(.-)%s*$")
+            if link == "" then return nil end
+            if not link:find("://", 1, true) then return link end
+            return link:match("[?&]privateServerLinkCode=([^&]+)")
+                or link:match("[?&]linkCode=([^&]+)")
+                or link:match("[?&]code=([^&]+)")
+        end
+        _G.TacoKickOut = function()
+            if _G.TacoKickToPS == true then
+                local code = psCode(_G.TacoPrivateServerLink)
+                if code and code ~= "" then
+                    local ok = pcall(function()
+                        game:GetService("ExperienceService"):LaunchExperience({
+                            placeId = tonumber(_G.TacoPrivateServerPlaceId) or game.PlaceId,
+                            linkCode = code,
+                        })
+                    end)
+                    if ok then return end
+                end
+            end
+            if pcall(function() game:Shutdown() end) then return end
+            pcall(function() LP:Kick("w hub discord.gg/neegypriv") end)
+        end
+    end
+    -- ================================================================
+    -- AUTO KICK ON STEAL -- THE REF'S, PORTED WHOLE.
+    --
+    -- The attribute version did not work because it was watching the wrong
+    -- thing. LP:GetAttribute("Stealing") flips for the hold, and it flips
+    -- back on a cancelled hold, a lagback, a ragdoll -- and on this build the
+    -- changed signal does not reliably land at all. the ref never touches it.
+    --
+    -- the ref reads the GAME'S OWN notification. It hooks every TextLabel,
+    -- TextButton and TextBox under PlayerGui, on creation and on every Text
+    -- change, and looks for the string "you stole". That toast only appears
+    -- when the server has already credited you the brainrot. It cannot fire
+    -- early, it cannot fire on a failed steal, and it needs no carry probe.
+    --
+    -- Main menu only: LP:Kick("") and nothing else. the ref calls
+    -- game:Shutdown() first, which closes the client -- dropped on purpose.
+    -- No LaunchExperience, no private-server hop, no rejoin.
+    -- ================================================================
+    if _G.TacoKickMenu == nil then
+        _G.TacoKickMenu = function()
+            pcall(function() LP:Kick("w hub discord.gg/neegypriv") end)
+        end
+    end
+    if not _G.__TacoAutoKickWatcher then
+        _G.__TacoAutoKickWatcher = true
+        task.spawn(function()
+            local playerGui = LP:WaitForChild("PlayerGui", 30)
+            if not playerGui then return end
+            local KW = tostring(_G.TacoAutoKickKeyword or "you stole"):lower()
+            local hooked = setmetatable({}, { __mode = "k" })
+            local fired = false
+            local function doKick(t)
+                if fired then return end
+                fired = true
+                if _G.TacoLog then pcall(_G.TacoLog, "AUTOKICK", { text = tostring(t):sub(1, 60) }) end
+                local d = tonumber(_G.TacoAutoKickDelay) or 0
+                if d > 0 then task.wait(d) end
+                _G.TacoKickMenu()
+            end
+            local function checkText(t)
+                if _G.TacoAutoKickOnSteal ~= true then return false end
+                -- Boot grace: never kick before the panel exists.
+                local _b0 = tonumber(_G.__TacoBootClock) or 0
+                if os.clock() - _b0 < (tonumber(_G.TacoAutoKickBootGrace) or 12) then
+                    return false
+                end
+                if string.find(string.lower(t), KW, 1, true) then
+                    task.spawn(doKick, t)
+                    return true
+                end
+                return false
+            end
+            local function hookObj(obj)
+                if hooked[obj] then return end
+                hooked[obj] = true
+                if checkText(tostring(obj.Text or "")) then return end
+                obj:GetPropertyChangedSignal("Text"):Connect(function()
+                    checkText(tostring(obj.Text or ""))
+                end)
+            end
+            local function isText(o)
+                return o:IsA("TextLabel") or o:IsA("TextButton") or o:IsA("TextBox")
+            end
+            local function watchRoot(root)
+                for _, obj in ipairs(root:GetDescendants()) do
+                    if isText(obj) then pcall(hookObj, obj) end
+                end
+                root.DescendantAdded:Connect(function(desc)
+                    if isText(desc) then pcall(hookObj, desc) end
+                end)
+            end
+            for _, g in ipairs(playerGui:GetChildren()) do pcall(watchRoot, g) end
+            playerGui.ChildAdded:Connect(function(g) pcall(watchRoot, g) end)
+            if _G.TacoLog then pcall(_G.TacoLog, "AUTOKICK_WATCHER_UP", { kw = KW }) end
+        end)
+    end
+    if _G.TacoSetWalkSpeed == nil then
+        local myFn
+        local conn
+        myFn = function(enabled)
+            _G.TacoWalkSpeedOn = enabled and true or false
+            if conn then conn:Disconnect(); conn = nil end
+            if not _G.TacoWalkSpeedOn then return end
+            conn = RunService.Heartbeat:Connect(function(dt)
+                if _G.TacoSetWalkSpeed ~= myFn then
+                    if conn then conn:Disconnect(); conn = nil end
+                    return
+                end
+                if not _G.TacoWalkSpeedOn then
+                    if conn then conn:Disconnect(); conn = nil end
+                    return
+                end
+                local char = LP.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                if not hum or not hrp then return end
+                local md = hum.MoveDirection
+                if md.Magnitude < 0.1 then return end
+                local spd = math.clamp(tonumber(_G.TacoWalkSpeed) or 26, 5, 32)
+                if spd <= hum.WalkSpeed then return end
+                hrp.CFrame = hrp.CFrame + (md * (spd - hum.WalkSpeed) * (dt or 0.016))
+            end)
+        end
+        _G.TacoSetWalkSpeed = myFn
+        if _G.TacoWalkSpeedOn == true then
+            task.defer(function() pcall(myFn, true) end)
+        end
+    end
+end)()
+
+-- ============================================================
+-- NEEGY SYNC-STEAL : predictive begin so the steal bar is 100%
+-- at arrival regardless of base position. Uses ETA vs hold time
+-- to time the begin remote during the cruise phase.
+-- ============================================================
+do
+    -- ETA-based sync now lives inside the gate itself. These knobs stay
+    -- exposed for autoexec overrides:
+    --   _G.TacoStealHoldDuration -- how long the bar takes to fill (s)
+    --   _G.TacoStealETASlack     -- grace window past exact ETA (s, default 0.08)
+    --   _G.TacoFlingMult         -- speed/cruise ratio that counts as a fling (default 1.6)
+    _G.TacoStealETASlack = tonumber(_G.TacoStealETASlack) or 0.04
+    _G.TacoFlingMult     = tonumber(_G.TacoFlingMult) or 1.6
+end
+
+end -- NEEGY PRIV TP ENGINE
 
 -- ══════════════════════════════════════════════════════════════════
 -- NEEGY -> SILENCE HUB BRIDGE (compatibility globals)
 -- ══════════════════════════════════════════════════════════════════
-_G.SH_ManualFullTP  = function(...) return manualFullTP(...) end
-_G.MynxxStartSideTP = manualFullTP
-_G.SH_DoVelocityTP  = function(...) return doVelocityTP(...) end
-_G.MynxxAutoTP = _G.TacoAutoTP
-_G.SH_AutoTPOnRespawn = _G.TacoAutoTPOnRespawn
-_G.SH_ScanAllPets = scanAllPets
+_G.SH_ManualFullTP  = _G.TacoStartSideTP
+_G.MynxxStartSideTP = _G.TacoStartSideTP
+_G.SH_DoVelocityTP  = function() if _G.TacoStartSideTP then _G.TacoStartSideTP() end end
+_G.SH_ScanAllPets   = _G.TacoScanAllPets
 
--- TP state bridge
-RunService.Heartbeat:Connect(function()
+local _neegyBridgeConn = game:GetService('RunService').Heartbeat:Connect(function()
     if _G.SH_TPStop == true then _G.TacoTPStop = true end
     if _G.TacoTPStop == true then _G.MynxxTPStop = true end
-    _G.SH_TPActive = isTeleporting or (_G.TacoIsTeleporting == true)
+    _G.SH_TPActive = (_G.TacoIsTeleporting == true)
     _G.MynxxAutoTP = _G.TacoAutoTP
 end)
-
 
 
 -- ================================================================
@@ -19594,12 +21894,25 @@ end
 end -- ENGINE 9-A
 
 -- ============================================================
--- SILENCE HUB SUPPLEMENTAL KEYBINDS (merged with neegy T/V/J)
+-- 10A. UNIFIED KEYBIND LISTENER (merged silence + neegy)
 -- ============================================================
 UIS.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
     if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    local kn = input.KeyCode.Name
     local kc = input.KeyCode
+
+    -- Manual TP — configurable key, default T
+    do
+        local want = _G._stp_tpKeyName
+        if type(want) ~= "string" or want == "" then want = "T" end
+        if kn == want then
+            task.spawn(function()
+                if _G.TacoStartSideTP then pcall(_G.TacoStartSideTP) end
+            end)
+            return
+        end
+    end
 
     -- Toggle UI — LeftControl hides/shows main panel + sub-panels
     if kc == Enum.KeyCode.LeftControl then
@@ -19636,6 +21949,25 @@ UIS.InputBegan:Connect(function(input, gameProcessed)
         return
     end
 
+    -- Stop TP — J
+    if kc == Enum.KeyCode.J then
+        _G.SH_TPStop = true
+        _G.TacoTPStop = true
+        task.spawn(function()
+            pcall(function()
+                local ch = LP.Character
+                local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+                if hrp then hrp.Velocity = Vector3.new(0, 0, 0) end
+                local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+                if hum then hum:ChangeState(Enum.HumanoidStateType.GettingUp) end
+            end)
+            task.wait(0.5)
+            _G.SH_TPStop = false
+            _G.TacoTPStop = false
+        end)
+        return
+    end
+
     -- Kick — P
     if kc == Enum.KeyCode.P then
         task.spawn(function()
@@ -19644,10 +21976,18 @@ UIS.InputBegan:Connect(function(input, gameProcessed)
         return
     end
 
+    -- Clone — V
+    if kc == Enum.KeyCode.V then
+        task.spawn(function()
+            if _G.TacoInstantClone then pcall(_G.TacoInstantClone) end
+        end)
+        return
+    end
+
     -- Configurable insta-reset key
     do
         local rk = _G.SH_ResetKeyName
-        if type(rk) == "string" and rk ~= "" and input.KeyCode.Name == rk then
+        if type(rk) == "string" and rk ~= "" and kn == rk then
             task.spawn(function()
                 if _G.SH_InstaReset then pcall(_G.SH_InstaReset) end
             end)
