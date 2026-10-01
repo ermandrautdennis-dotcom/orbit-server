@@ -1348,7 +1348,7 @@ local LP = Players.LocalPlayer
 -- ENGINE 1: Remote Name Update (hash table + resolver)
 -- ============================================================================
 do
-    _G.SH_GetRemote = getRemote
+    local getRemote = _G.SH_GetRemote
 
     local _REMOTE_HASH = _G.SH_RemoteHash or {
         ["UseItem"] = "068a62948a73ec6c61f9f22ada765e9fc2add9b70cb9e2da5732837444a3f862",
@@ -1405,6 +1405,7 @@ end
 -- ENGINE 2: Grapple System (equip, fire, carpet engage)
 -- ============================================================================
 do
+    local getRemote = _G.SH_GetRemote
     local GRAPPLE_ARG = 0.8
     local CARPET_SPEED = 280
     local CARPET_NAMES = { "Flying Carpet", "Waverider", "Santa's Sleigh", "Witch's Broom", "Cupid's Wings" }
