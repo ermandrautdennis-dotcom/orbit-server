@@ -1323,361 +1323,7 @@ local function getRemote(method, name)
     return _G.__secureGetRemote(method, name)
 end
 _G.SH_GetRemote = getRemote
-end
--- ══ RAILTP ENGINE (velocity cruise) ══
-do
-
-local RailTP = {}
-
-local Players        = game:GetService("Players")
-local RunService     = game:GetService("RunService")
-local Workspace      = game:GetService("Workspace")
-local LP             = Players.LocalPlayer
-
---============================================================================
--- CONFIG (plain KV file, not JSON)
---============================================================================
-local CFG_PATH = "railtp.cfg"
-
-local defaults = {
-    cruise        = 480,
-    approach      = 80,
-    brakeRadius   = 60,
-    arriveRadius  = 5.5,
-    settleTime    = 0.22,
-    hover         = 0,
-    tickHz        = 60,
-    maxAirTime    = 25,
-}
-
-local S = {}
-for k,v in pairs(defaults) do S[k] = v end
-
-local function _loadCfg()
-    if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
-    if not isfile(CFG_PATH) then return end
-    local raw = readfile(CFG_PATH)
-    for line in tostring(raw):gmatch("[^\r\n]+") do
-        local k, v = line:match("^([%w_]+)%s*=%s*(.+)$")
-        if k and v and defaults[k] ~= nil then
-            local n = tonumber(v)
-            if n then S[k] = n end
-        end
-    end
-end
-
-local function _saveCfg()
-    if type(writefile) ~= "function" then return end
-    local buf = {}
-    for k,v in pairs(S) do buf[#buf+1] = k .. "=" .. tostring(v) end
-    pcall(writefile, CFG_PATH, table.concat(buf, "\n"))
-end
-
-_loadCfg()
-
---============================================================================
--- CHARACTER PLUMBING
---============================================================================
-local char, hum, hrp
-local att, mover, aligner
-
-local function _charReady()
-    char = LP.Character or LP.CharacterAdded:Wait()
-    hum  = char:WaitForChild("Humanoid", 5)
-    hrp  = char:WaitForChild("HumanoidRootPart", 5)
-    return hum and hrp
-end
-
-local function _teardownMover()
-    if att then pcall(function() att:Destroy() end); att = nil end
-    if mover then pcall(function() mover:Destroy() end); mover = nil end
-    if aligner then pcall(function() aligner:Destroy() end); aligner = nil end
-end
-
-local function _buildMover()
-    _teardownMover()
-    if not (hrp and hrp.Parent) then return false end
-    att = Instance.new("Attachment")
-    att.Name = "_rtp_anchor"
-    att.Parent = hrp
-
-    mover = Instance.new("LinearVelocity")
-    mover.Name = "_rtp_drive"
-    mover.Attachment0 = att
-    mover.RelativeTo = Enum.ActuatorRelativeTo.World
-    mover.ForceLimitMode = Enum.ForceLimitMode.PerAxis
-    mover.MaxAxesForce = Vector3.new(2.5e5, 2.5e5, 2.5e5)
-    mover.VectorVelocity = Vector3.zero
-    mover.Enabled = false
-    mover.Parent = hrp
-
-    aligner = Instance.new("AlignOrientation")
-    aligner.Name = "_rtp_face"
-    aligner.Attachment0 = att
-    aligner.Mode = Enum.OrientationAlignmentMode.OneAttachment
-    aligner.Responsiveness = 40
-    aligner.MaxTorque = 1e5
-    aligner.Enabled = false
-    aligner.Parent = hrp
-    return true
-end
-
---============================================================================
--- STATE
---============================================================================
-local state = "idle"
-local settleStartTs = 0
-local target = nil
-local arriveCbs = {}
-local startTs = 0
-local lastTickTs = 0
-local activeConn
-
-local function _pushArriveCb(fn) arriveCbs[#arriveCbs+1] = fn end
-local function _flushArrive()
-    local list = arriveCbs; arriveCbs = {}
-    for _,fn in ipairs(list) do task.spawn(fn) end
-end
-
---============================================================================
--- SCANNER
---============================================================================
-local function _plotList()
-    local out = {}
-    for _,inst in ipairs(Workspace:GetChildren()) do
-        if inst:IsA("Model") or inst:IsA("Folder") then
-            local pods = inst:FindFirstChild("AnimalPodiums", true)
-            if pods then out[#out+1] = {root = inst, pods = pods} end
-        end
-    end
-    return out
-end
-
-local function _readOverheadName(podium)
-    local main = podium:FindFirstChild("Main") or podium:FindFirstChild("Base")
-    if not main then return nil end
-    for _,d in ipairs(main:GetDescendants()) do
-        if d:IsA("TextLabel") and d.Text and #d.Text > 0 then
-            local t = d.Text
-            if not t:find("%$") and not t:find("/s") and #t < 40 then
-                return t
-            end
-        end
-    end
-    return nil
-end
-
-local function _podiumCFrame(podium)
-    local base = podium:FindFirstChild("Base") or podium
-    if base:IsA("BasePart") then return base.CFrame end
-    local ok, cf = pcall(function() return podium:GetPivot() end)
-    if ok then return cf end
-    return nil
-end
-
-function RailTP.rescanPets()
-    local out = {}
-    for _,plot in ipairs(_plotList()) do
-        for _,podium in ipairs(plot.pods:GetChildren()) do
-            local cf   = _podiumCFrame(podium)
-            local name = _readOverheadName(podium)
-            if cf and name then
-                out[#out+1] = {
-                    plot = plot.root.Name,
-                    slot = podium.Name,
-                    name = name,
-                    cf   = cf,
-                }
-            end
-        end
-    end
-    return out
-end
-
---============================================================================
--- CRUISE LOOP
---============================================================================
-local function _stopLoop()
-    if activeConn then pcall(function() activeConn:Disconnect() end); activeConn = nil end
-    if mover then mover.VectorVelocity = Vector3.zero; mover.Enabled = false end
-    if aligner then aligner.Enabled = false end
-end
-
-local _savedCollide = {}
-local function _phaseOn()
-    if not char then return end
-    _savedCollide = {}
-    for _, d in ipairs(char:GetDescendants()) do
-        if d:IsA("BasePart") and d.CanCollide then
-            _savedCollide[d] = true
-            pcall(function() d.CanCollide = false end)
-        end
-    end
-end
-local function _phaseOff()
-    for p, _ in pairs(_savedCollide) do
-        if p and p.Parent then pcall(function() p.CanCollide = true end) end
-    end
-    _savedCollide = {}
-end
-
-local function _arriveNow()
-    state = "arrived"
-    _stopLoop()
-    _phaseOff()
-    if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.Freefall) end) end
-    _flushArrive()
-    state = "idle"
-    target = nil
-end
-
-local function _startLoop()
-    _stopLoop()
-    if not _buildMover() then return end
-    if _G.TacoRailPhase ~= false then _phaseOn() end
-    mover.Enabled = true
-    aligner.Enabled = true
-    startTs = os.clock()
-    lastTickTs = startTs
-    state = "cruising"
-
-    settleStartTs = 0
-    activeConn = RunService.Heartbeat:Connect(function()
-        if not (hrp and hrp.Parent and target) then _arriveNow() return end
-        if os.clock() - startTs > S.maxAirTime then _arriveNow() return end
-
-        -- anti-die: keep character alive during cruise
-        if _G.TacoRailAntiDie ~= false then
-            local char = hrp.Parent
-            local hum  = char and char:FindFirstChildOfClass("Humanoid")
-            if hum then
-                if hum.Health < hum.MaxHealth then
-                    pcall(function() hum.Health = hum.MaxHealth end)
-                end
-                pcall(function() hum.BreakJointsOnDeath = false end)
-                pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Dead, false) end)
-                pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false) end)
-                pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false) end)
-                pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Physics, false) end)
-            end
-            local voidY = tonumber(_G.TacoRailVoidFloor) or -400
-            if hrp.Position.Y < voidY then
-                pcall(function()
-                    hrp.CFrame = CFrame.new(hrp.Position.X, target.Y + math.max(S.hover, 8), hrp.Position.Z)
-                    hrp.AssemblyLinearVelocity = Vector3.zero
-                end)
-            end
-        end
-
-        local aim   = target + Vector3.new(0, S.hover, 0)
-        local here  = hrp.Position
-        local delta = aim - here
-        local dist  = delta.Magnitude
-
-        -- settle phase: hold upright at target before firing arrive
-        if state == "settling" then
-            local settleDur = tonumber(_G.TacoSettleTime) or S.settleTime
-            local pull = delta
-            local pmag = pull.Magnitude
-            if pmag > 0.05 then pull = pull / pmag * math.min(pmag * 6, 40) end
-            mover.VectorVelocity = pull
-            aligner.CFrame = CFrame.lookAt(here, Vector3.new(aim.X, here.Y, aim.Z))
-            if os.clock() - settleStartTs >= settleDur then _arriveNow() end
-            return
-        end
-
-        if dist <= S.arriveRadius then
-            state = "settling"
-            settleStartTs = os.clock()
-            return
-        end
-
-        local speed
-        if dist <= S.brakeRadius then
-            state = "braking"
-            local t = dist / S.brakeRadius
-            speed = math.max(S.approach * (t * t), 25)
-        else
-            state = "cruising"
-            speed = S.cruise
-        end
-
-        local dir = (dist > 0.001) and (delta / dist) or Vector3.zero
-        mover.VectorVelocity = dir * speed
-        aligner.CFrame = CFrame.lookAt(here, Vector3.new(aim.X, here.Y, aim.Z))
-    end)
-end
-
---============================================================================
--- PUBLIC API
---============================================================================
-function RailTP.setCruise(v)        S.cruise = tonumber(v) or S.cruise; _saveCfg() end
-function RailTP.setArrivalRadius(v) S.arriveRadius = tonumber(v) or S.arriveRadius; _saveCfg() end
-function RailTP.setHover(v)         S.hover = tonumber(v) or S.hover; _saveCfg() end
-
-function RailTP.state()    return state end
-function RailTP.isActive() return state ~= "idle" and state ~= "arrived" end
-
-function RailTP.onArrive(fn) if type(fn) == "function" then _pushArriveCb(fn) end end
-
-function RailTP.release()
-    _stopLoop()
-    _phaseOff()
-    _teardownMover()
-    state = "idle"
-    target = nil
-end
-
-function RailTP.cruiseTo(dest)
-    if typeof(dest) == "CFrame" then dest = dest.Position end
-    if typeof(dest) ~= "Vector3" then return false, "bad target" end
-    if not _charReady() then return false, "no character" end
-    target = dest
-    state = "arming"
-    _startLoop()
-    return true
-end
-
-function RailTP.cruisePet(petName, plotName)
-    local hits = RailTP.rescanPets()
-    local want = tostring(petName or ""):lower()
-    local best, bestScore
-    for _,h in ipairs(hits) do
-        if not plotName or h.plot == plotName then
-            local n = h.name:lower()
-            local score
-            if n == want then score = 3
-            elseif n:find(want, 1, true) then score = 2
-            elseif want:find(n, 1, true) then score = 1
-            end
-            if score and (not bestScore or score > bestScore) then
-                best, bestScore = h, score
-            end
-        end
-    end
-    if not best then return false, "no match" end
-    return RailTP.cruiseTo(best.cf.Position)
-end
-
--- character respawn hookup
-task.spawn(function()
-    while not LP do LP = Players.LocalPlayer; if not LP then task.wait(0.1) end end
-    pcall(function()
-        LP.CharacterAdded:Connect(function()
-            task.wait(0.15)
-            _charReady()
-            if RailTP.isActive() and target then
-                _startLoop()
-            end
-        end)
-    end)
-    _charReady()
-end)
-
-RailTP.getTarget = function() return target end
-
-_G.RailTP = RailTP
-
+_G.SH_LoadModules = loadModules   -- consumed by the Silence TP engine
 end
 -- ============================================================================
 -- SECTION 4 — GRAPPLE, SCANNER & ESP ENGINES
@@ -1995,6 +1641,9 @@ do
     end
 
     _G.SH_EquipCarpet = equipCarpet
+    _G.SH_CarpetEngage = carpetEngage   -- consumed by the Silence TP engine (ENGINE 9-0)
+    _G.SH_FindTool = findTool
+    _G.SH_CarpetNames = CARPET_NAMES
     _G.SH_CarpetEngaging = function() return _carpetEngaging end
 
     -- Keep carpet on respawn
@@ -4513,13 +4162,6 @@ end
 
 -- NEEGY TAB
 do local f=tabFrames["Neegy"];local C=Color3.fromRGB(200,168,75)
-    mkSection(f,"RailTP Cruise",C)
-    mkSlider(f,"Cruise Speed",100,1000,_G.SH_Config and _G.SH_Config.railCruise or 480,function(v)
-        if _G.RailTP then pcall(_G.RailTP.setCruise,v) end
-        if _G.SH_Config then _G.SH_Config.railCruise=v end
-        saveSettings()
-    end,10,C)
-
     mkSection(f,"Flight",C)
     do local _,_s,_g=mkToggle(f,"Flight Noclip",true,function(on)
         _G.SH_FlightNoclip=on
@@ -9518,7 +9160,6 @@ if _G.AntiDieDisabled == nil then _G.AntiDieDisabled = false end
             if _G.SH_StealHold == true then return true end
             if _G.__SH_ArmActive == true then return true end
             if _G.SH_TPActive == true then return true end
-            if RailTP and RailTP.isActive and RailTP.isActive() then return true end
             return false
         end
         while true do
@@ -9621,6 +9262,2517 @@ end
 -- ║  SECTION 9 : STEAL + TP ENGINE                                 ║
 -- ║  Merged from Silence Hub (JAF autograb) + Neegy (steal system)  ║
 -- ╚══════════════════════════════════════════════════════════════════╝
+
+-- ╔══════════════════════════════════════════════════════════════════╗
+-- ║  ENGINE 9-0 : SILENCE HUB TP ENGINE (doVelocityTP & friends)     ║
+-- ║  Extracted 1:1 from the original Silence Hub (lines 12619-14956) ║
+-- ║  scanForTP / route planner (voxel A*, center + row detours) /    ║
+-- ║  velMoveThrough (LinearVelocity flight) / clone / goToBrainrot / ║
+-- ║  doVelocityTP / manualFullTP / carpet + tool prewarm.            ║
+-- ║                                                                  ║
+-- ║  Globals renamed: _G.SXE_* / _G.SXE* -> _G.SH_*                  ║
+-- ║  _G.Mynxx* knobs are kept as-is (Silence Hub's own config).      ║
+-- ║                                                                  ║
+-- ║  Exposed:  _G.SH_DoVelocityTP, _G.SH_ManualFullTP,               ║
+-- ║            _G.MynxxStartSideTP, _G.SH_ComputeRoute, ...          ║
+-- ║  File-scope forward locals (used by ENGINE 10A below):   ║
+-- ║            doVelocityTP, manualFullTP, doClone, equipCarpet,     ║
+-- ║            scanAllPets, loadModules, loadNet                     ║
+-- ╚══════════════════════════════════════════════════════════════════╝
+
+-- Forward declarations: later sections (10A keybinds, 10E auto-TP) call these
+-- by bare name, so they must be visible past the do...end below.
+local doVelocityTP, manualFullTP, doClone
+local equipCarpet, scanAllPets, loadModules, loadNet
+
+do
+
+-- ── Bridges to the merged file's existing engines (no duplication) ──────────
+-- ENGINE 2 (grapple/carpet) and ENGINE 5 (scanAllPets) keep their helpers
+-- local to their own do-blocks and publish them through _G.SH_*.
+_G.SH_Step = _G.SH_Step or function() end   -- sequence-log stub (was SXE_Step)
+
+local LPH_NO_VIRTUALIZE = LPH_NO_VIRTUALIZE or function(f) return f end
+
+local function CARPET_SPEED() return tonumber(_G.TPVelocity) or 280 end
+local SKY_CLONE_WAIT = tonumber(_G.SKY_CLONE_WAIT) or 0.35
+local CARPET_NAMES = _G.SH_CarpetNames
+    or { "Flying Carpet", "Waverider", "Santa's Sleigh", "Witch's Broom", "Cupid's Wings" }
+
+local function getRemote(method, name)
+    local g = _G.SH_GetRemote
+    if type(g) == "function" then return g(method, name) end
+    return nil
+end
+
+local function findTool(name)
+    local f = _G.SH_FindTool
+    if type(f) == "function" then return f(name) end
+    local char = LP.Character
+    local bp = LP:FindFirstChild("Backpack")
+    return (char and char:FindFirstChild(name)) or (bp and bp:FindFirstChild(name))
+end
+
+equipCarpet = function()
+    local f = _G.SH_EquipCarpet
+    if type(f) == "function" then return f() end
+    local char = LP.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return nil end
+    for _, n in ipairs(CARPET_NAMES) do
+        local t = findTool(n)
+        if t and t:IsA("Tool") then
+            if t.Parent ~= char then pcall(function() hum:EquipTool(t) end) end
+            return n
+        end
+    end
+    return nil
+end
+
+local function carpetEngage(force)
+    local f = _G.SH_CarpetEngage
+    if type(f) == "function" then return f(force) end
+    return equipCarpet()
+end
+
+scanAllPets = function(light)
+    local f = _G.SH_ScanAllPets
+    if type(f) == "function" then return f(light) end
+    return {}
+end
+
+loadModules = function()
+    local f = _G.SH_LoadModules
+    if type(f) == "function" then return f() end
+    return true
+end
+
+local NetModule
+loadNet = function()
+    if type(NetModule) == "table" then return true end
+    local n = (type(_G.Net) == "table" and _G.Net) or (type(_G.SH_Net) == "table" and _G.SH_Net) or nil
+    if n then NetModule = n; return true end
+    return false
+end
+_G.SH_LoadNet = _G.SH_LoadNet or loadNet
+
+local function getPlotChannel(plotName)
+    local channel
+    pcall(function()
+        if type(_G.SH_GetPlotChannel) == "function" then channel = _G.SH_GetPlotChannel(plotName)
+        elseif type(_G.SH_SyncGet) == "function" then channel = _G.SH_SyncGet(plotName) end
+    end)
+    return channel
+end
+
+local function channelGet(channel, key)
+    if not channel then return nil end
+    if type(_G.SH_ChannelGet) == "function" then
+        local ok, v = pcall(_G.SH_ChannelGet, channel, key)
+        if ok and v ~= nil then return v end
+    end
+    local v
+    pcall(function()
+        local ct = rawget(channel, "CacheTable")
+        if type(ct) == "table" then v = ct[key] end
+    end)
+    if v ~= nil then return v end
+    pcall(function()
+        local d = rawget(channel, "Data")
+        if type(d) == "table" then v = d[key] end
+    end)
+    if v ~= nil then return v end
+    pcall(function() v = rawget(channel, key) end)
+    return v
+end
+
+-- M/s fallback for pets whose scan MPS is 0 (uses the hub's AnimalsShared shim)
+local function _up9Mps(entry)
+    local v = 0
+    pcall(function()
+        local shim = _G._shAnimShim
+        if shim and entry and entry.Index then
+            v = shim:GetGeneration(entry.Index, entry.Mutation, entry.Traits, nil) or 0
+        end
+    end)
+    return v
+end
+
+-- Find the Quantum Cloner "change with clone" button (by name OR text)
+local function _findCloneBtn(root)
+    if not root then return nil end
+    for _, v in ipairs(root:GetDescendants()) do
+        if v:IsA("TextButton") or v:IsA("ImageButton") then
+            local n = v.Name:lower()
+            local t = (v:IsA("TextButton") and v.Text or ""):lower()
+            if n:find("change") or n:find("clone") or n:find("teleport") or n:find("swap")
+            or t:find("change") or t:find("clone") then
+                return v
+            end
+        end
+    end
+    return nil
+end
+
+-- Grapple fired right before the TP starts. The original used the Silence-only
+-- aimbot grapple (SXEFireGrapple2); the merged hub fires the remote through
+-- ENGINE 2 instead (no equip, so the carpet in hand is left alone).
+_G.SH_FireGrapple2 = _G.SH_FireGrapple2 or function(_dest)
+    if LP:GetAttribute("Stealing") then return false end
+    local f = _G.SH_FireGrappleBoth or _G.SH_FireGrappleAggressive
+    if type(f) ~= "function" then return false end
+    local ok, r = pcall(f)
+    return (ok and r) and true or false
+end
+
+-- ═════════════ BEGIN EXTRACTED SILENCE HUB TP CODE ═════════════
+local function scanForTP()
+    -- PATCHED v8: read from central scanner cache — no extra scan cost
+    local ls = _G.SH_LastScan
+    if ls and ls.t > 0 and (os.clock() - ls.t) < 0.1 then
+        return ls.pets
+    end
+    return scanAllPets()  -- fallback if central scanner not running yet
+end
+
+-- Deux logiques separees:
+-- 1) TP sync  -> apres un TP, auto-steal reste colle a CETTE pet
+-- 2) A pied   -> priority / nearest, ZERO sync
+local function _petUid(p)
+    if not p then return nil end
+    return tostring(p.plot) .. "_" .. tostring(p.slot)
+end
+-- [CODE MORT SUPPRIME] _pickPetOnFoot: jamais appele (l'auto-steal a sa propre selection).
+local function _findTPSyncedPet(pets)
+    local uid = _G.MynxxStealTargetUID
+    if type(uid) ~= "string" or uid == "" then return nil end
+    for _, p in ipairs(pets) do
+        if _petUid(p) == uid then return p end
+    end
+    return nil
+end
+local function _clearTPSync()
+    _G.MynxxTPSyncActive = false
+    _G.MynxxStealTargetUID = nil
+end
+-- [CODE MORT SUPPRIME] _armTPSync: jamais appele.
+_G.MynxxClearTPSync = _clearTPSync
+-- compat anciens appels
+local function _findStealTarget(pets)
+    if not _G.MynxxTPSyncActive then return nil end
+    return _findTPSyncedPet(pets)
+end
+-- [CODE MORT SUPPRIME] _publishStealTarget: jamais appele.
+
+-- ===== lines 773-2506 from hub a =====
+local UPPER = {
+    B = {{coord=Vector3.new(-487.921448,16.850713,-75.768013),facing="NORTH"},{coord=Vector3.new(-332.379730,16.850722,-75.762100),facing="NORTH"},{coord=Vector3.new(-487.134918,16.850713,-18.094154),facing="SOUTH"},{coord=Vector3.new(-316.300171,16.850713,-17.845898),facing="SOUTH"}},
+    C = {{coord=Vector3.new(-330.765381,16.850713,31.424425),facing="NORTH"},{coord=Vector3.new(-502.989349,16.850713,31.172430),facing="NORTH"},{coord=Vector3.new(-489.077087,16.850713,89.010147),facing="SOUTH"},{coord=Vector3.new(-330.908936,16.850713,88.930145),facing="SOUTH"}},
+    D = {{coord=Vector3.new(-331.264893,16.850713,138.209167),facing="NORTH"},{coord=Vector3.new(-487.935181,16.850713,138.026321),facing="NORTH"},{coord=Vector3.new(-487.774933,16.850713,195.882538),facing="SOUTH"},{coord=Vector3.new(-330.799133,16.850575,196.022354),facing="SOUTH"}},
+}
+local LOWER = {
+    B = {{coord=Vector3.new(-335.725586,-3.048217,-74.984589),facing="NORTH"},{coord=Vector3.new(-503.214233,-3.048217,-75.043137),facing="NORTH"},{coord=Vector3.new(-483.619385,-3.718430,-18.844337),facing="SOUTH"},{coord=Vector3.new(-316.147095,-3.048218,-18.818844),facing="SOUTH"}},
+    C = {{coord=Vector3.new(-335.985413,-3.048218,32.051426),facing="NORTH"},{coord=Vector3.new(-503.277008,-3.048217,31.956175),facing="NORTH"},{coord=Vector3.new(-483.749390,-3.048218,88.147003),facing="SOUTH"},{coord=Vector3.new(-315.793823,-3.048217,88.163979),facing="SOUTH"}},
+    D = {{coord=Vector3.new(-335.476654,-3.048218,139.001083),facing="NORTH"},{coord=Vector3.new(-503.710083,-3.048218,138.989883),facing="NORTH"},{coord=Vector3.new(-315.654938,-3.048218,195.302444),facing="SOUTH"},{coord=Vector3.new(-483.859253,-3.048218,195.269043),facing="SOUTH"}},
+}
+local UPPER_Y_THRESHOLD = 7
+local TALL_PETS = { ["La Secret Combinasion"]=true, ["La Jolly Grande"]=true }
+local TALL_OFFSET = 3
+
+local BASES_LOW = {
+    [1] = Vector3.new(-476.52, -2, 220.94090270996094),
+    [2] = Vector3.new(-476.52, -2, 113.77315521240234),
+    [3] = Vector3.new(-476.52, -2, 6.178487777709961),
+    [4] = Vector3.new(-476.52, -2, -101.07275390625),
+    [5] = Vector3.new(-342.66, -2, 221.44737243652344),
+    [6] = Vector3.new(-342.66, -2, 113.41409301757812),
+    [7] = Vector3.new(-342.66, -2, 6.249461650848389),
+    [8] = Vector3.new(-342.66, -2, -99.73458862304688),
+}
+local BASES_HIGH = {
+    [1] = Vector3.new(-479.51, 18, 220.94090270996094),
+    [2] = Vector3.new(-479.51, 18, 113.77315521240234),
+    [3] = Vector3.new(-479.51, 18, 6.178487777709961),
+    [4] = Vector3.new(-479.51, 18, -101.07275390625),
+    [5] = Vector3.new(-339.48, 18, 221.44737243652344),
+    [6] = Vector3.new(-339.48, 18, 113.41409301757812),
+    [7] = Vector3.new(-339.48, 18, 6.249461650848389),
+    [8] = Vector3.new(-339.48, 18, -99.73458862304688),
+}
+local FRONT_Y_LOW   = -3.048217
+local FRONT_Y_HIGH  = 16.850713
+local COLUMN_SPLIT_X = -410
+local FRONT_Z_CLAMP  = 18
+local SIDE_NEAR_Z    = 45
+
+local function getClosestBaseIdx(pos)
+    local closest, dist = 1, math.huge
+    for i = 1, 8 do
+        local b = BASES_LOW[i]
+        local d = (pos.X - b.X)^2 + (pos.Z - b.Z)^2
+        if d < dist then dist = d; closest = i end
+    end
+    return closest
+end
+
+local function buildFrontCandidate(idx, isUpper, playerZ)
+    local base = isUpper and BASES_HIGH[idx] or BASES_LOW[idx]
+    local frontY = isUpper and FRONT_Y_HIGH or FRONT_Y_LOW
+    local frontZ = math.clamp(playerZ - base.Z, -FRONT_Z_CLAMP, FRONT_Z_CLAMP) + base.Z
+    local coord = Vector3.new(base.X, frontY, frontZ)
+    local faceDir = (idx <= 4) and Vector3.new(-1, 0, 0) or Vector3.new(1, 0, 0)
+    return coord, faceDir
+end
+
+local function plotSides(coordTable, idx)
+    local base = BASES_LOW[idx]
+    local isWest = idx <= 4
+    local out = {}
+    for _, coords in pairs(coordTable) do
+        for _, data in ipairs(coords) do
+            if ((data.coord.X < COLUMN_SPLIT_X) == isWest)
+               and math.abs(data.coord.Z - base.Z) < SIDE_NEAR_Z then
+                out[#out + 1] = data
+            end
+        end
+    end
+    return out
+end
+
+local function _floor1LaserSolid(plotName)
+    local solid = false
+    pcall(function()
+        local Plots = workspace:FindFirstChild("Plots")
+        local plot = Plots and Plots:FindFirstChild(plotName)
+        if not plot then return end
+        for _, d in ipairs(plot:GetDescendants()) do
+            if d:IsA("BasePart") and (d.Name == "LaserHitbox" or d.Name == "Laser")
+                and d.CanCollide and d.Position.Y <= 9 then
+                solid = true
+                break
+            end
+        end
+    end)
+    return solid
+end
+
+local function isPlotUnlocked(plotName)
+    local ok, res = pcall(function()
+        local channel = getPlotChannel(plotName)
+        if not channel then return false end
+        if channelGet(channel, "BlockEndTimeFirstFloor") ~= nil then return false end
+        return not _floor1LaserSolid(plotName)
+    end)
+    return ok and (res == true)
+end
+
+local function findClosest(petPos, coordTable)
+    local best, bestKey, bestDist = nil, nil, math.huge
+    for skyKey, coords in pairs(coordTable) do
+        for _, data in ipairs(coords) do
+            local c = data.coord
+            local d = math.sqrt((petPos.X - c.X)^2 + (petPos.Z - c.Z)^2)
+            if d < bestDist then bestDist = d; best = data; bestKey = skyKey end
+        end
+    end
+    return best, bestKey
+end
+
+local SPEED = 125
+local ARRIVE = 3
+local _STRIP_OK = false -- PATCHED: connection stripping disabled (AC-detected)
+local function _climbCap()
+    -- Plafond de montee. L'ancien maximum etait 250, et 55 en secours: c'etait
+    -- le principal ralentissement d'un vol direct vers un pet en hauteur.
+    -- _G.MynxxClimb pour regler.
+    local v = math.clamp(tonumber(_G.MynxxClimb) or 400, 20, 800)
+    if not _STRIP_OK then v = math.min(v, tonumber(_G.MynxxClimbSafe) or 250) end
+    return v
+end
+
+local function vZero(hrp)
+    if hrp then hrp.AssemblyLinearVelocity = Vector3.zero; hrp.AssemblyAngularVelocity = Vector3.zero end
+end
+
+local function velMoveThrough(hrp, waypoints, speedOverride, allowJump, quickStart)
+    if not hrp or not hrp.Parent or #waypoints == 0 then return end
+    local _runSpeed = speedOverride or (tonumber(_G.TPVelocity) and math.clamp(tonumber(_G.TPVelocity), 20, 750)) or CARPET_SPEED()
+
+    -- TRAJET DIRECT AVEC ESQUIVE.
+    -- On ne jette pas les waypoints a l'aveugle: pour chaque point de depart on
+    -- vise le point le PLUS LOIN qu'on puisse atteindre en ligne droite sans
+    -- obstacle (_clearWide teste aussi une marge laterale et verticale).
+    -- Resultat: ligne droite partout ou c'est possible, et un point de passage
+    -- conserve uniquement la ou il y a vraiment quelque chose a contourner.
+    -- _G.MynxxDirect = false pour suivre le chemin du pathfinder tel quel.
+    if _G.MynxxDirect ~= false and #waypoints > 1
+       and type(_G.SH_ClearWide) == "function" then
+        local ok, court = pcall(function()
+            local res = {}
+            local from = hrp.Position
+            local i = 1
+            while i <= #waypoints do
+                -- on cherche le point le plus lointain visible depuis "from"
+                local best = i
+                local voieLibre = _G.SH_ClearWide
+                for j = #waypoints, i, -1 do
+                    if voieLibre(from, waypoints[j]) then best = j break end
+                end
+                res[#res + 1] = waypoints[best]
+                from = waypoints[best]
+                i = best + 1
+            end
+            return res
+        end)
+        if ok and court and #court > 0 then waypoints = court end
+    end
+
+    -- PATCHED: LinearVelocity constraint — server sees physics force, not raw velocity write
+    local _mcCap = _climbCap()
+    local _lvAtt, _lvMover
+    local function _tearLV()
+        pcall(function() if _lvMover then _lvMover.Enabled = false; _lvMover:Destroy(); _lvMover = nil end end)
+        pcall(function() if _lvAtt then _lvAtt:Destroy(); _lvAtt = nil end end)
+    end
+    local function _makeLV()
+        _tearLV()
+        if not (hrp and hrp.Parent) then return end
+        pcall(function()
+            _lvAtt = Instance.new("Attachment")
+            _lvAtt.Name = "_sxe_drv"
+            _lvAtt.Parent = hrp
+            _lvMover = Instance.new("LinearVelocity")
+            _lvMover.Name = "_sxe_vel"
+            _lvMover.Attachment0 = _lvAtt
+            _lvMover.RelativeTo = Enum.ActuatorRelativeTo.World
+            _lvMover.ForceLimitMode = Enum.ForceLimitMode.PerAxis
+            _lvMover.MaxAxesForce = Vector3.new(2.5e5, 2.5e5, 2.5e5)
+            _lvMover.VectorVelocity = Vector3.zero
+            _lvMover.Enabled = true
+            _lvMover.Parent = hrp
+        end)
+    end
+    _makeLV()
+
+    local function _boost(vers)
+        if not (hrp and hrp.Parent and vers) then return end
+        local d = vers - hrp.Position
+        if d.Magnitude < 0.1 then return end
+        local u = d.Unit
+        local s = _runSpeed
+        local vx, vy, vz = u.X * s, u.Y * s, u.Z * s
+        if vy > _mcCap then
+            if _G.MynxxClimbFull then
+                local k = _mcCap / vy
+                vx, vy, vz = vx * k, _mcCap, vz * k
+            else
+                vy = _mcCap
+            end
+        end
+        local v = Vector3.new(vx, vy, vz)
+        -- PATCHED: set constraint velocity (undetected) instead of direct write
+        if _lvMover and _lvMover.Parent then
+            _lvMover.VectorVelocity = v
+        else
+            pcall(function() hrp.Velocity = v; hrp.AssemblyLinearVelocity = v end)
+        end
+    end
+
+    -- poussee de depart, avant meme le Heartbeat:Connect
+    _boost(waypoints[1])
+
+    local wpIdx = 1
+    local done = false
+    local conn
+    local function finish()
+        if done then return end
+        done = true
+        _tearLV()  -- PATCHED: destroy LinearVelocity constraint on arrival
+        if hrp and hrp.Parent then
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+            local _, y = hrp.CFrame:ToEulerAnglesYXZ()
+            hrp.CFrame = CFrame.new(waypoints[#waypoints]) * CFrame.Angles(0, y, 0)
+        end
+        if conn then conn:Disconnect() end
+    end
+    local lastDist, stall = math.huge, 0
+    local _lastPos, _lastMoveT = nil, nil
+    local _jumpDone = false
+
+    local _stStart = os.clock()
+
+    local _ = quickStart
+
+    local _carpetInHand = nil
+    -- Resolus une fois par vol: _climbCap ne depend que d'un global fixe, et le
+    -- Humanoid ne change pas pendant le trajet. Avant: recalcules a chaque frame.
+    local _mcCached = _climbCap()
+    local _humCached = hrp.Parent and hrp.Parent:FindFirstChildOfClass("Humanoid")
+    conn = RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
+        if not hrp or not hrp.Parent or done then
+            if conn then conn:Disconnect() end
+            return
+        end
+        if _G.MynxxTPStop then finish() return end
+        -- equipCarpet faisait jusqu'a 10 recherches (5 noms x Backpack+Character)
+        -- a CHAQUE frame du vol, pour un carpet deja en main. On ne le rappelle
+        -- que si l'outil a reellement quitte le personnage.
+        if not (_carpetInHand and _carpetInHand.Parent == hrp.Parent) then
+            local _cn = equipCarpet()
+            local _ch = hrp.Parent
+            _carpetInHand = _cn and _ch and _ch:FindFirstChild(_cn) or nil
+        end
+        local target = waypoints[wpIdx]
+        local diff = target - hrp.Position
+        local mag = diff.Magnitude
+        -- Freins retires: le frein periodique (0.15s toutes les 0.5s, penalite
+        -- croissante) et le frein de virage (a 240) calculaient _spd, qui n'est
+        -- plus lu depuis que le deplacement se fait par poussee. Ils tournaient
+        -- a chaque frame sans effet.
+        -- rayon d'arrivee base sur la vitesse REELLE du vol (les anciens freins
+        -- ne s'appliquent plus en trajet direct)
+        local _arr = math.max(ARRIVE, _runSpeed / 60 * 1.25)
+        if mag < _arr then
+            wpIdx = wpIdx + 1
+            if wpIdx > #waypoints then finish() return end
+            lastDist, stall = math.huge, 0
+            _lastPos, _lastMoveT = nil, nil
+            target = waypoints[wpIdx]
+            diff = target - hrp.Position
+            mag = diff.Magnitude
+            -- MEME POUSSEE qu'au depart, sur le nouveau waypoint.
+            _boost(target)
+            return
+        end
+
+        -- Detection de blocage EN TEMPS, plus en frames.
+        -- Avant: "stall >= 18" comptait des FRAMES, et la distance etait mesuree
+        -- au waypoint courant. Deux consequences a haut framerate:
+        --   - 18 frames = 0.045s a 400 FPS (au lieu de 0.3s a 60 FPS)
+        --   - a l'approche d'un virage la distance au waypoint cesse de
+        --     diminuer alors que le vol est parfaitement normal
+        -- Le faux blocage se declenchait donc en rafale et snapait le perso de
+        -- waypoint en waypoint: c'est le vol hache ressenti apres ~0.1s.
+        -- Ici on ne declenche que si le perso n'a REELLEMENT pas bouge dans le
+        -- monde pendant N secondes. _G.MynxxStallSec pour regler (defaut 0.6).
+        do
+            local _t = os.clock()
+            local _p = hrp.Position
+            if (not _lastPos) or (_p - _lastPos).Magnitude > 1.5 then
+                _lastPos, _lastMoveT = _p, _t
+            end
+            stall = ((_t - (_lastMoveT or _t)) >= (tonumber(_G.MynxxStallSec) or 0.6)) and 999 or 0
+        end
+        lastDist = mag
+        if stall >= 18 then
+            _lastPos, _lastMoveT = nil, nil
+            stall = 0
+            -- Upward push damit Charakter über Objekte kommt, dann boost
+            pcall(function()
+                -- PATCHED: stall upward push via constraint
+                if _lvMover and _lvMover.Parent then
+                    local cur = _lvMover.VectorVelocity
+                    _lvMover.VectorVelocity = Vector3.new(cur.X, math.max(cur.Y, 45), cur.Z)
+                else
+                    local _vel = hrp.AssemblyLinearVelocity
+                    hrp.AssemblyLinearVelocity = Vector3.new(_vel.X, math.max(_vel.Y, 45), _vel.Z)
+                end
+            end)
+            task.delay(0.12, function()
+                if hrp and hrp.Parent then
+                    pcall(_boost, target)
+                end
+            end)
+            return
+        end
+        -- PLUS D'ECRITURE PAR FRAME. Entre deux waypoints la physique porte le
+        -- perso. On ne remet un coup que s'il a REELLEMENT ralenti (choc,
+        -- amortissement du Humanoid) -- sinon on ne touche a rien.
+        -- _G.MynxxRepushAt = 0 pour ne jamais re-pousser.
+        do
+            -- 0.9: on relance des que la vitesse descend de 10%. A 0.55 le perso
+            -- pouvait perdre pres de la moitie de sa vitesse avant d'etre relance.
+            local seuil = (tonumber(_G.MynxxRepushAt) or 0.9) * _runSpeed
+            if seuil > 0 and hrp.AssemblyLinearVelocity.Magnitude < seuil then
+                _boost(target)
+            end
+        end
+        -- Le SAUT reste actif: c'est lui qui fait decoller le perso au depart.
+        -- Seule l'ecriture de vitesse par frame a ete retiree (remplacee par la
+        -- poussee a chaque waypoint, plus haut).
+        -- "wpIdx < #waypoints" excluait le DERNIER waypoint. En trajet direct il
+        -- n'y en a qu'un: le saut ne se declenchait jamais et le perso ne
+        -- decollait pas. On l'autorise aussi sur le dernier point.
+        -- Le saut ne sert qu'a DECOLLER. Avant il etait rejoue tant que la
+        -- destination etait plus haute, donc pendant toute la montee: chaque
+        -- ChangeState(Jumping) rend la main au Humanoid, qui applique sa propre
+        -- impulsion et combat la poussee -> a-coups en plein vol.
+        -- _G.MynxxJumpOnce = false pour revenir au saut repete.
+        if (not _jumpDone) and mag >= 0.1 and (allowJump or diff.Y > 10) and diff.Y > 5 then
+            if _G.MynxxJumpOnce ~= false then _jumpDone = true end
+            -- Resolution paresseuse: si le Humanoid n'existe pas encore au
+            -- depart du vol (frequent juste apres un clone), le mettre en
+            -- cache une seule fois ferait perdre le saut pour tout le trajet.
+            if not (_humCached and _humCached.Parent) then
+                _humCached = hrp.Parent and hrp.Parent:FindFirstChildOfClass("Humanoid")
+            end
+            local hum = _humCached
+            if hum then
+                local st = hum:GetState()
+                if st ~= Enum.HumanoidStateType.Jumping and st ~= Enum.HumanoidStateType.Freefall then
+                    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+                    pcall(function() hum.Jump = true end)
+                end
+            end
+        end
+    end))
+    local totalDist = 0
+    local prev = hrp.Position
+    for _, wp in ipairs(waypoints) do
+        totalDist = totalDist + (prev - wp).Magnitude
+        prev = wp
+    end
+    local timeout = totalDist / math.min(SPEED, _runSpeed) + 2
+    local elapsed = 0
+    while not done and elapsed < timeout do
+        task.wait(0.05)
+        elapsed = elapsed + 0.05
+    end
+    finish()
+    vZero(hrp)
+end
+
+local _OTHER_CLONES = {}
+do
+    local _MY_CLONE = tostring(LP.UserId) .. "_Clone"
+    local _seen = {}
+    local function _isOtherClone(n)
+        return type(n) == "string" and n ~= _MY_CLONE and n:match("^%d+_Clone$") ~= nil
+    end
+    local function _neutralize(inst)
+        if not inst or _seen[inst] then return end
+        _seen[inst] = true
+        _OTHER_CLONES[#_OTHER_CLONES + 1] = inst
+        local function declaw(d)
+            if d:IsA("BasePart") and d.CanCollide then pcall(function() d.CanCollide = false end) end
+        end
+        for _, d in ipairs(inst:GetDescendants()) do declaw(d) end
+        inst.DescendantAdded:Connect(declaw)
+        inst.Destroying:Connect(function()
+            _seen[inst] = nil
+            for i = #_OTHER_CLONES, 1, -1 do
+                if _OTHER_CLONES[i] == inst then table.remove(_OTHER_CLONES, i); break end
+            end
+        end)
+    end
+    local function _scan(inst)
+        if _isOtherClone(inst.Name) then _neutralize(inst) end
+    end
+    for _, c in ipairs(workspace:GetChildren()) do _scan(c) end
+    workspace.ChildAdded:Connect(function(c)
+        -- Un Model est le seul type qui peut etre un clone: on ecarte tout le
+        -- reste (effets, projectiles, parts) sans rien allouer.
+        if not c:IsA("Model") then return end
+        if _isOtherClone(c.Name) then _neutralize(c) return end
+        -- 2e passe seulement si le nom n'est pas encore pose. Avant: une closure
+        -- task.defer creee pour CHAQUE objet ajoute au monde.
+        if c.Name == "Model" then
+            task.defer(function() if c and c.Parent == workspace then _scan(c) end end)
+        end
+    end)
+end
+
+-- [SUPPRIME] declaw all-players: faisait GetDescendants sur le perso de TOUS les
+-- joueurs toutes les 3s (gros cout constant), pas necessaire au TP.
+
+-- Pathfinding helpers wrapped in a do-block so their ~30 locals free after,
+-- leaving only computeRoute + _len live in the main chunk (register budget).
+local computeRoute, _len
+do
+local _DIRS = { Vector3.new(1,0,0), Vector3.new(-1,0,0), Vector3.new(0,0,1), Vector3.new(0,0,-1) }
+local _STRUCT = { ["structure base home"] = true, ["Wall"] = true, ["Floor"] = true, ["Roof"] = true }
+local _SKIP_NAME = { ["DeliveryHitbox"]=true, ["StealHitbox"]=true, ["LaserHitbox"]=true,
+    ["AnimalTarget"]=true, ["Multiplier"]=true, ["Laser"]=true, ["Hitbox"]=true,
+    ["Spawn"]=true, ["MainRoot"]=true, ["SecondFloor"]=true, ["ThirdFloor"]=true, ["Slope"]=true }
+local function _blocks(inst)
+    if not inst then return false end
+    if _SKIP_NAME[inst.Name] then return false end
+    if inst.CanCollide then return true end
+    if _STRUCT[inst.Name] then return true end
+    local s = inst.Size
+    if s and math.max(s.X * s.Y, s.X * s.Z, s.Y * s.Z) > 150 then return true end
+    return false
+end
+local function _blocksWide(inst)
+    if not inst then return false end
+    if _SKIP_NAME[inst.Name] then return false end
+    if inst.CanCollide then return true end
+    if _STRUCT[inst.Name] then return true end
+    local s = inst.Size
+    if s and math.max(s.X * s.Y, s.X * s.Z, s.Y * s.Z) > 30 then return true end
+    return false
+end
+local function _block(origin, target, blockFn)
+    blockFn = blockFn or _blocks
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.IgnoreWater = true
+    local skip = {}
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl.Character then skip[#skip + 1] = pl.Character end
+    end
+    for _, cl in ipairs(_OTHER_CLONES) do skip[#skip + 1] = cl end
+    local o = origin
+    for _ = 1, 16 do
+        rp.FilterDescendantsInstances = skip
+        local d = target - o
+        if d.Magnitude < 0.05 then return nil end
+        local res = workspace:Raycast(o, d, rp)
+        if not res then return nil end
+        if blockFn(res.Instance) then return res end
+        skip[#skip + 1] = res.Instance
+        o = res.Position + d.Unit * 0.3
+    end
+    return nil
+end
+local function _clear(a, b) return _block(a, b) == nil end
+function _len(pts)
+    local s, prev = 0, pts[1]
+    for k = 2, #pts do s = s + (pts[k] - prev).Magnitude; prev = pts[k] end
+    return s
+end
+-- [CODE MORT SUPPRIME] _pull/_stages/_routeClear/_peakY/_starts/_candidates :
+-- ancien systeme de pathfinding, remplace par computeRoute + _vx. Jamais appeles.
+
+local PathfindingService = game:GetService("PathfindingService")
+local _CLEARANCE = 16
+local function _clearWideRay(a, b)
+    return _block(a, b, _blocksWide) == nil
+end
+
+local _SWEEP_R = 4
+local _ENDPOINT_SLACK = 6
+local _canSphere = nil
+local function _sweepBlockFn(inst)
+    if _G.MynxxStrictSweep == false then return _blocks(inst) end
+    return _blocksWide(inst)
+end
+local function _sweepDir(a, b)
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.IgnoreWater = true
+    local skip = {}
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl.Character then skip[#skip + 1] = pl.Character end
+    end
+    for _, cl in ipairs(_OTHER_CLONES) do skip[#skip + 1] = cl end
+    local o = a
+    for _ = 1, 24 do
+        rp.FilterDescendantsInstances = skip
+        local d = b - o
+        if d.Magnitude < 0.05 then return false end
+        local res
+        local ok = pcall(function() res = workspace:Spherecast(o, _SWEEP_R, d, rp) end)
+        if not ok then _canSphere = false; return nil end
+        if not res then return false end
+        if _sweepBlockFn(res.Instance) then return true end
+        skip[#skip + 1] = res.Instance
+        local adv = (res.Distance or 0) - 0.05
+        if adv > 0 then o = o + d.Unit * math.min(adv, d.Magnitude) end
+    end
+    return true
+end
+local function _sweepBlocked(a, b, slackA, slackB)
+    if _canSphere == nil then
+        _canSphere = pcall(function()
+            workspace:Spherecast(Vector3.new(0, 10000, 0), 1, Vector3.new(0, -1, 0), RaycastParams.new())
+        end)
+    end
+    if not _canSphere then return nil end
+    local d = b - a
+    local len = d.Magnitude
+    if len < 0.1 then return false end
+    local u = d / len
+    local a2 = a + u * math.min(slackA or _ENDPOINT_SLACK, len * 0.4)
+    local b2 = b - u * math.min(slackB or _ENDPOINT_SLACK, len * 0.4)
+    local fwd = _sweepDir(a2, b2)
+    if fwd == nil then return nil end
+    if fwd then return true end
+    local rev = _sweepDir(b2, a2)
+    if rev == nil then return nil end
+    return rev
+end
+
+-- publie pour velMoveThrough, qui est defini plus haut dans le fichier
+local _clearWide
+_G.SH_ClearWide = function(a, b, sa, sb) return _clearWide(a, b, sa, sb) end
+function _clearWide(a, b, slackA, slackB)
+    if not _clear(a, b) then return false end
+    local sw = _sweepBlocked(a, b, slackA, slackB)
+    if sw ~= nil then return not sw end
+    local d = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+    if d.Magnitude < 0.1 then
+        local ox = Vector3.new(_CLEARANCE, 0, 0)
+        local oz = Vector3.new(0, 0, _CLEARANCE)
+        return _clearWideRay(a + ox, b + ox) and _clearWideRay(a - ox, b - ox)
+            and _clearWideRay(a + oz, b + oz) and _clearWideRay(a - oz, b - oz)
+    end
+    local perp = Vector3.new(-d.Z, 0, d.X).Unit * _CLEARANCE
+    local up = Vector3.new(0, _CLEARANCE, 0)
+    return _clearWideRay(a + perp, b + perp)
+        and _clearWideRay(a - perp, b - perp)
+        and _clearWideRay(a + up, b + up)
+        and _clearWideRay(a - up, b - up)
+end
+
+local function _pullWide(pts)
+    if #pts <= 2 then return pts end
+    local out = { pts[1] }
+    local i = 1
+    local n = #pts
+    while i < n do
+        local j = n
+        while j > i + 1 do
+            local a, b = out[#out], pts[j]
+            local sA = (i == 1) and _ENDPOINT_SLACK or 0
+            local sB = (j == n) and _ENDPOINT_SLACK or 0
+            if _clearWide(a, b, sA, sB) then break end
+            j = j - 1
+        end
+        out[#out + 1] = pts[j]
+        i = j
+    end
+    return out
+end
+
+local function _pushOffWalls(pts)
+    if #pts <= 2 then return pts end
+    local MARGIN = 8
+    local MAX_PUSH = 12
+    local out = { pts[1] }
+    for i = 2, #pts - 1 do
+        local p = pts[i]
+        local shift = Vector3.zero
+        for _, dr in ipairs(_DIRS) do
+            local res = _block(p, p + dr * MARGIN, _blocks)
+            if res then
+                local dist = (res.Position - p).Magnitude
+                if dist < MARGIN then
+                    shift = shift - dr * (MARGIN - dist)
+                end
+            end
+        end
+        do
+            local resUp = _block(p, p + Vector3.new(0, MARGIN, 0), _blocks)
+            if resUp then
+                local dist = (resUp.Position - p).Magnitude
+                if dist < 4 then shift = shift + Vector3.new(0, -(4 - dist), 0) end
+            end
+        end
+        if shift.Magnitude > 0.1 then
+            if shift.Magnitude > MAX_PUSH then shift = shift.Unit * MAX_PUSH end
+            local moved = p + shift
+            if _clear(out[#out], moved) then
+                out[#out + 1] = moved
+            else
+                out[#out + 1] = p
+            end
+        else
+            out[#out + 1] = p
+        end
+    end
+    out[#out + 1] = pts[#pts]
+    return out
+end
+
+local voxelRoute
+do
+local _vxFloor, _vxSqrt = math.floor, math.sqrt
+local _vxMin, _vxMax = math.min, math.max
+local function _vxAbs(n) return n < 0 and -n or n end
+
+local _vxOverlap = OverlapParams.new()
+_vxOverlap.FilterType = Enum.RaycastFilterType.Exclude
+_vxOverlap.RespectCanCollide = true
+
+local _vxCast = RaycastParams.new()
+_vxCast.FilterType = Enum.RaycastFilterType.Exclude
+_vxCast.RespectCanCollide = true
+_vxCast.IgnoreWater = true
+
+local _vxOrigin
+local _vxDimX, _vxDimY, _vxDimZ = 0, 0, 0
+local _vxSz, _vxInflate = 4, 3.0   -- inflate 2.5 -> 3.0 : un peu plus de marge autour des obstacles
+local _vxSolid = {}
+local _vxHeight = 5.5              -- 5 -> 5.5 : un peu plus exigeant en hauteur
+
+local function _vxWorld(sz, x, y, z)
+    local h = sz * 0.5
+    return Vector3.new(_vxOrigin.X + x * sz + h, _vxOrigin.Y + y * sz + h, _vxOrigin.Z + z * sz + h)
+end
+local function _vxKey(x, y, z) return x + y * 1024 + z * 1048576 end
+
+local function _vxIsSolid(x, y, z)
+    if x < 0 or y < 0 or z < 0 or x >= _vxDimX or y >= _vxDimY or z >= _vxDimZ then return true end
+    local k = _vxKey(x, y, z)
+    local c = _vxSolid[k]
+    if c ~= nil then return c end
+    local h = _vxSz * 0.5
+    local cx = _vxOrigin.X + x * _vxSz + h
+    local cy = _vxOrigin.Y + y * _vxSz + h
+    local cz = _vxOrigin.Z + z * _vxSz + h
+    local sxz = _vxSz + _vxInflate
+    local vy = _vxHeight > _vxSz and _vxHeight or _vxSz
+    local vcy = cy - h + vy * 0.5
+    local parts = workspace:GetPartBoundsInBox(CFrame.new(cx, vcy, cz), Vector3.new(sxz, vy, sxz), _vxOverlap)
+    local solid = #parts > 0
+    _vxSolid[k] = solid
+    return solid
+end
+
+local function _vxSegClear(from, to, radius, height, sample)
+    local dir = to - from
+    local mag = dir.Magnitude
+    if mag < 0.05 then return true end
+    if workspace:Raycast(from, dir, _vxCast) then return false end
+    local r = radius > 1 and radius or 1
+    if workspace:Blockcast(CFrame.new(from), Vector3.new(r * 2, height, r * 2), dir, _vxCast) ~= nil then return false end
+    local n = _vxFloor(mag)
+    if sample ~= false and n >= 2 then
+        local step = dir / n
+        local torso = Vector3.new(r * 2, 3, r * 2)
+        for i = 1, n - 1 do
+            local pt = from + step * i
+            if #workspace:GetPartBoundsInBox(CFrame.new(pt), torso, _vxOverlap) > 0 then return false end
+        end
+    end
+    return true
+end
+
+local _vxNeigh = {}
+do
+    for dx = -1, 1 do
+        for dy = -1, 1 do
+            for dz = -1, 1 do
+                if dx ~= 0 or dy ~= 0 or dz ~= 0 then
+                    local nz = (dx ~= 0 and 1 or 0) + (dy ~= 0 and 1 or 0) + (dz ~= 0 and 1 or 0)
+                    local kd = dx + dy * 1024 + dz * 1048576
+                    _vxNeigh[#_vxNeigh + 1] = { dx, dy, dz, _vxSqrt(dx * dx + dy * dy + dz * dz), nz, kd }
+                end
+            end
+        end
+    end
+end
+
+local function _vxNoCorner(cx, cy, cz, off)
+    if off[5] < 2 then return true end
+    if off[1] ~= 0 and _vxIsSolid(cx + off[1], cy, cz) then return false end
+    if off[2] ~= 0 and _vxIsSolid(cx, cy + off[2], cz) then return false end
+    if off[3] ~= 0 and _vxIsSolid(cx, cy, cz + off[3]) then return false end
+    return true
+end
+
+local function _vxSnapGoal(goalPos, x, y, z)
+    if not _vxIsSolid(x, y, z) then return x, y, z end
+    for r = 1, 16 do
+        for dx = -r, r do
+            for dy = -r, r do
+                for dz = -r, r do
+                    if _vxMax(_vxAbs(dx), _vxAbs(dy), _vxAbs(dz)) == r then
+                        local nx, ny, nz = x + dx, y + dy, z + dz
+                        if not _vxIsSolid(nx, ny, nz) and (_vxWorld(_vxSz, nx, ny, nz) - goalPos).Magnitude <= 8 then
+                            return nx, ny, nz
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return x, y, z
+end
+local function _vxSnapStart(pos, x, y, z)
+    if not _vxIsSolid(x, y, z) then return x, y, z end
+    for r = 1, 16 do
+        for dx = -r, r do
+            for dy = -r, r do
+                for dz = -r, r do
+                    if _vxMax(_vxAbs(dx), _vxAbs(dy), _vxAbs(dz)) == r then
+                        local nx, ny, nz = x + dx, y + dy, z + dz
+                        if not _vxIsSolid(nx, ny, nz) and not workspace:Raycast(pos, _vxWorld(_vxSz, nx, ny, nz) - pos, _vxCast) then
+                            return nx, ny, nz
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return x, y, z
+end
+
+local function _vxPush(h, f, key)
+    local i = #h + 1
+    h[i] = { f, key }
+    while i > 1 do
+        local p = _vxFloor(i * 0.5)
+        if h[p][1] <= h[i][1] then break end
+        h[p], h[i] = h[i], h[p]
+        i = p
+    end
+end
+local function _vxPop(h)
+    local n = #h
+    if n == 0 then return nil end
+    local top = h[1]
+    h[1] = h[n]
+    h[n] = nil
+    n -= 1
+    local i = 1
+    while true do
+        local l, r, s = i + i, i + i + 1, i
+        if l <= n and h[l][1] < h[s][1] then s = l end
+        if r <= n and h[r][1] < h[s][1] then s = r end
+        if s == i then break end
+        h[i], h[s] = h[s], h[i]
+        i = s
+    end
+    return top[2]
+end
+
+local _vxHeurW = 2
+local function _vxAStar(sz, startCell, goalCell, startPos, goalPos)
+    local sx, sy, sz2 = _vxSnapStart(startPos, startCell.x, startCell.y, startCell.z)
+    local gx, gy, gz = _vxSnapGoal(goalPos, goalCell.x, goalCell.y, goalCell.z)
+    local goalKey = _vxKey(gx, gy, gz)
+    local startKey = _vxKey(sx, sy, sz2)
+
+    local nodes = { [startKey] = { x = sx, y = sy, z = sz2, g = 0, parent = nil } }
+    local closed = {}
+    local heap = {}
+    _vxPush(heap, 0, startKey)
+
+    local function Heur(x, y, z)
+        local ax, ay, az = x - gx, y - gy, z - gz
+        return _vxSqrt(ax * ax + ay * ay + az * az)
+    end
+
+    local pops = 0
+    while #heap > 0 do
+        local curKey = _vxPop(heap)
+        if closed[curKey] then continue end
+        closed[curKey] = true
+        pops += 1
+        if pops > 300000 then break end
+
+        local cur = nodes[curKey]
+        if curKey == goalKey then
+            local path = {}
+            local n = cur
+            while n do
+                path[#path + 1] = _vxWorld(sz, n.x, n.y, n.z)
+                n = n.parent and nodes[n.parent]
+            end
+            local rev = {}
+            for i = #path, 1, -1 do rev[#rev + 1] = path[i] end
+            return rev
+        end
+
+        local cx, cy, cz = cur.x, cur.y, cur.z
+        local cg = cur.g
+        for _, off in _vxNeigh do
+            local nk = curKey + off[6]
+            if closed[nk] then continue end
+            local nx, ny, nz = cx + off[1], cy + off[2], cz + off[3]
+            if _vxIsSolid(nx, ny, nz) then continue end
+            if not _vxNoCorner(cx, cy, cz, off) then continue end
+            local tg = cg + off[4]
+            local ex = nodes[nk]
+            if not ex or tg < ex.g then
+                if ex then
+                    ex.g, ex.parent, ex.x, ex.y, ex.z = tg, curKey, nx, ny, nz
+                else
+                    nodes[nk] = { x = nx, y = ny, z = nz, g = tg, parent = curKey }
+                end
+                _vxPush(heap, tg + _vxHeurW * Heur(nx, ny, nz), nk)
+            end
+        end
+    end
+    return nil
+end
+
+local function _vxSimplify(path, radius, height)
+    if not path or #path < 3 then return path end
+    local out = { path[1] }
+    local anchor = 1
+    local i = 2
+    while i <= #path do
+        if not _vxSegClear(path[anchor], path[i + 1] or path[i], radius, height, false) then
+            out[#out + 1] = path[i]
+            anchor = i
+        end
+        i += 1
+    end
+    out[#out + 1] = path[#path]
+    return out
+end
+
+voxelRoute = function(fromPos, toPos)
+    local char = LP.Character
+    local _flt = char and { char } or {}
+    for _, cl in ipairs(_OTHER_CLONES) do _flt[#_flt + 1] = cl end
+    _vxOverlap.FilterDescendantsInstances = _flt
+    _vxCast.FilterDescendantsInstances = _flt
+
+    local sz      = tonumber(_G.MynxxPathCell)   or 4
+    local inflate = tonumber(_G.MynxxPathRadius) or 2.5
+    local height  = tonumber(_G.MynxxPathHeight) or 5
+    local pad     = tonumber(_G.MynxxPathPad)    or 40
+
+    _vxSz, _vxInflate, _vxHeight = sz, inflate, height
+    table.clear(_vxSolid)
+
+    local mn = Vector3.new(_vxMin(fromPos.X, toPos.X), _vxMin(fromPos.Y, toPos.Y), _vxMin(fromPos.Z, toPos.Z)) - Vector3.new(pad, pad, pad)
+    local mx = Vector3.new(_vxMax(fromPos.X, toPos.X), _vxMax(fromPos.Y, toPos.Y), _vxMax(fromPos.Z, toPos.Z)) + Vector3.new(pad, pad, pad)
+    _vxOrigin = mn
+    local size = mx - mn
+    _vxDimX = _vxFloor(size.X / sz) + 1
+    _vxDimY = _vxFloor(size.Y / sz) + 1
+    _vxDimZ = _vxFloor(size.Z / sz) + 1
+    if _vxDimX * _vxDimY * _vxDimZ > 200000 then return nil end
+
+    local startCell = {
+        x = _vxFloor((fromPos.X - _vxOrigin.X) / sz),
+        y = _vxFloor((fromPos.Y - _vxOrigin.Y) / sz),
+        z = _vxFloor((fromPos.Z - _vxOrigin.Z) / sz),
+    }
+    local goalCell = {
+        x = _vxFloor((toPos.X - _vxOrigin.X) / sz),
+        y = _vxFloor((toPos.Y - _vxOrigin.Y) / sz),
+        z = _vxFloor((toPos.Z - _vxOrigin.Z) / sz),
+    }
+
+    local path = _vxAStar(sz, startCell, goalCell, fromPos, toPos)
+    if not path then return nil end
+    path = _vxSimplify(path, inflate, height)
+    if not path or #path == 0 then return nil end
+
+    local route = {}
+    for idx = 2, #path do route[#route + 1] = path[idx] end
+    if #route == 0 or (route[#route] - toPos).Magnitude > 0.5 then
+        route[#route + 1] = toPos
+    end
+    return route
+end
+
+end
+
+_G.MynxxVoxelRoute = voxelRoute
+
+-- =====================================================================
+-- CONTOURNEMENT DE LA ZONE CENTRALE (portage de mynxx)
+-- mynxx, ligne 6394: "A base straight across the map means the flight line
+-- crosses the center road. Flying straight over it makes the server rewind
+-- us to mid-path, so detour around the center first."
+-- Traverser la bande centrale en diagonale fait rembobiner le serveur en
+-- plein vol. On detecte le cas et on contourne par une des 4 allees.
+-- =====================================================================
+local _MAP_CENTER = { minX = -458, maxX = -362, minZ = -40, maxZ = 185 }
+local _BYPASS_Z_NORTH, _BYPASS_Z_SOUTH = 205, -95
+local _BYPASS_X_WEST,  _BYPASS_X_EAST  = -525, -295
+
+local function _inCenterZone(x, z)
+    return x >= _MAP_CENTER.minX and x <= _MAP_CENTER.maxX
+       and z >= _MAP_CENTER.minZ and z <= _MAP_CENTER.maxZ
+end
+
+-- echantillonne le segment en 10 points: une diagonale peut traverser le
+-- centre sans que ni le depart ni l arrivee n y soient
+local function _segmentCrossesCenter(a, b)
+    if _inCenterZone(a.X, a.Z) or _inCenterZone(b.X, b.Z) then return true end
+    for i = 1, 10 do
+        local t = i / 11
+        if _inCenterZone(a.X + (b.X - a.X) * t, a.Z + (b.Z - a.Z) * t) then return true end
+    end
+    return false
+end
+
+-- teste les 4 contournements (nord / sud / ouest / est), ne garde que ceux
+-- dont les 3 troncons sont degages, et renvoie le PLUS COURT
+local function _findBestCenterDetour(fromPos, toPos, y)
+    local candidates = {
+        { Vector3.new(fromPos.X, y, _BYPASS_Z_NORTH), Vector3.new(toPos.X, y, _BYPASS_Z_NORTH) },
+        { Vector3.new(fromPos.X, y, _BYPASS_Z_SOUTH), Vector3.new(toPos.X, y, _BYPASS_Z_SOUTH) },
+        { Vector3.new(_BYPASS_X_WEST, y, fromPos.Z), Vector3.new(_BYPASS_X_WEST, y, toPos.Z) },
+        { Vector3.new(_BYPASS_X_EAST, y, fromPos.Z), Vector3.new(_BYPASS_X_EAST, y, toPos.Z) },
+    }
+    local best, bestLen = nil, math.huge
+    for _, pair in ipairs(candidates) do
+        local w1, w2 = pair[1], pair[2]
+        if _clearWide(fromPos, w1) and _clearWide(w1, w2) and _clearWide(w2, toPos) then
+            local len = (fromPos - w1).Magnitude + (w1 - w2).Magnitude + (w2 - toPos).Magnitude
+            if len < bestLen then bestLen = len; best = { w1, w2 } end
+        end
+    end
+    return best
+end
+_G.MynxxSegmentCrossesCenter = _segmentCrossesCenter
+_G.MynxxFindCenterDetour     = _findBestCenterDetour
+
+-- =====================================================================
+-- CONTOURNEMENT DES BASES DE LA MEME RANGEE
+-- Aller 2 ou 3 bases plus loin sur la meme rangee = la ligne droite rase
+-- les facades intermediaires. Meme structure que le contournement du
+-- centre: on sort dans une allee parallele a la rangee, on la longe, on
+-- rentre. Chaque troncon est valide par _clearWide, sinon on abandonne.
+-- Reglable: _G.MynxxRowBoxX / _G.MynxxRowBoxZ (emprise consideree comme
+-- "dans la base") et _G.MynxxRowLane (ecart de l allee).
+-- =====================================================================
+local function _rowBoxX() return tonumber(_G.MynxxRowBoxX) or 26 end
+local function _rowBoxZ() return tonumber(_G.MynxxRowBoxZ) or 30 end
+local function _rowLane() return tonumber(_G.MynxxRowLane) or 30 end
+
+-- base la plus proche d un point (index dans BASES_LOW), si a portee
+local function _nearestBase(p)
+    local bi, bd = nil, math.huge
+    for i = 1, 8 do
+        local b = BASES_LOW[i]
+        local d = (p.X - b.X) ^ 2 + (p.Z - b.Z) ^ 2
+        if d < bd then bd = d; bi = i end
+    end
+    if bd > 70 * 70 then return nil end
+    return bi
+end
+
+-- le segment traverse-t-il une base AUTRE que celle de depart et d arrivee ?
+local function _segmentHitsOtherBase(a, b, ignA, ignB)
+    local hx, hz = _rowBoxX(), _rowBoxZ()
+    for i = 0, 24 do
+        local t = i / 24
+        local px = a.X + (b.X - a.X) * t
+        local pz = a.Z + (b.Z - a.Z) * t
+        for k = 1, 8 do
+            if k ~= ignA and k ~= ignB then
+                local bs = BASES_LOW[k]
+                if math.abs(px - bs.X) <= hx and math.abs(pz - bs.Z) <= hz then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function _findRowDetour(fromPos, toPos, y)
+    local iFrom, iTo = _nearestBase(fromPos), _nearestBase(toPos)
+    if not _segmentHitsOtherBase(fromPos, toPos, iFrom, iTo) then return nil end
+
+    -- colonne de la base visee: l allee se place a gauche ou a droite d elle
+    local colX = BASES_LOW[iTo or 1].X
+    local off  = _rowLane()
+    local lanes = {}
+    -- cote exterieur d abord (hors zone centrale, c est la ou le jeu place
+    -- deja ses points d entree lateraux)
+    local outer = (colX < COLUMN_SPLIT_X) and (colX - off) or (colX + off)
+    lanes[#lanes + 1] = outer
+    -- cote interieur seulement s il ne tombe pas dans la zone centrale,
+    -- sinon on declencherait le rewind serveur qu on vient d eviter
+    local inner = (colX < COLUMN_SPLIT_X) and (colX + off) or (colX - off)
+    if not _inCenterZone(inner, (fromPos.Z + toPos.Z) * 0.5) then
+        lanes[#lanes + 1] = inner
+    end
+
+    local best, bestLen = nil, math.huge
+    for _, laneX in ipairs(lanes) do
+        local w1 = Vector3.new(laneX, y, fromPos.Z)
+        local w2 = Vector3.new(laneX, y, toPos.Z)
+        if _clearWide(fromPos, w1) and _clearWide(w1, w2) and _clearWide(w2, toPos)
+           and not _segmentHitsOtherBase(w1, w2, iFrom, iTo) then
+            local len = (fromPos - w1).Magnitude + (w1 - w2).Magnitude + (w2 - toPos).Magnitude
+            if len < bestLen then bestLen = len; best = { w1, w2 } end
+        end
+    end
+    return best
+end
+_G.MynxxFindRowDetour = _findRowDetour
+
+function computeRoute(fromPos, toPos, facingDir, maxLift, preferCrest)
+    local _ = maxLift
+
+    -- Ne se declenche QUE si le trajet croise le centre ET que la ligne
+    -- directe n est pas deja degagee -> aucun detour inutile.
+    local centerPatch = nil
+    if _segmentCrossesCenter(fromPos, toPos) and not _clearWide(fromPos, toPos) then
+        centerPatch = _findBestCenterDetour(fromPos, toPos, fromPos.Y)
+        if centerPatch and #centerPatch > 0 then
+            -- on repart du dernier waypoint de contournement
+            fromPos = centerPatch[#centerPatch]
+        end
+    end
+    -- CONTOURNEMENT DE RANGEE: apres le centre, on regarde si le trajet
+    -- restant rase des bases intermediaires (cas "2-3 bases plus loin").
+    local rowPatch = _findRowDetour(fromPos, toPos, fromPos.Y)
+    if rowPatch and #rowPatch > 0 then
+        fromPos = rowPatch[#rowPatch]
+    end
+
+    -- prefixe les waypoints de contournement (centre puis rangee) a une route
+    local function _withPatch(route)
+        if (not centerPatch or #centerPatch == 0)
+           and (not rowPatch or #rowPatch == 0) then return route end
+        local merged = {}
+        if centerPatch then for _, p in ipairs(centerPatch) do merged[#merged + 1] = p end end
+        if rowPatch    then for _, p in ipairs(rowPatch)    do merged[#merged + 1] = p end end
+        for _, p in ipairs(route) do merged[#merged + 1] = p end
+        return merged
+    end
+
+    if _clearWide(fromPos, toPos) then return _withPatch({ toPos }) end
+
+    if preferCrest then
+        local cruiseY = math.max(fromPos.Y, toPos.Y, 26) + 12
+        local up   = Vector3.new(fromPos.X, cruiseY, fromPos.Z)
+        local over = Vector3.new(toPos.X,   cruiseY, toPos.Z)
+        local crest = { fromPos, up, over, toPos }
+        local ok = true
+        for i = 1, #crest - 1 do
+            local a, b = crest[i], crest[i + 1]
+            if (a - b).Magnitude > 0.5 then
+                local sA = (i == 1) and _ENDPOINT_SLACK or 0
+                local sB = (i == #crest - 1) and _ENDPOINT_SLACK or 0
+                if not _clearWide(a, b, sA, sB) then ok = false; break end
+            end
+        end
+        if ok then return _withPatch(crest) end
+    end
+
+    do
+        local vr = voxelRoute(fromPos, toPos)
+        if vr and #vr > 0 then return _withPatch(vr) end
+    end
+
+    local entry = facingDir and (toPos - facingDir * 14) or toPos
+
+    local best, bestLen = nil, math.huge
+    local function consider(pts)
+        if not pts or #pts < 2 then return end
+        local n = #pts
+        for i = 1, n - 1 do
+            local a, b = pts[i], pts[i + 1]
+            if (a - b).Magnitude > 0.5 then
+                local sA = (i == 1) and _ENDPOINT_SLACK or 0
+                local sB = (i == n - 1) and _ENDPOINT_SLACK or 0
+                if not _clearWide(a, b, sA, sB) then return end
+            end
+        end
+        local pulled = _pullWide(pts)
+        local L = _len(pulled)
+        if L < bestLen then best, bestLen = pulled, L end
+    end
+
+    do
+        local dirF = Vector3.new(entry.X - fromPos.X, 0, entry.Z - fromPos.Z)
+        if dirF.Magnitude > 0.1 then
+            dirF = dirF.Unit
+            local perp = Vector3.new(-dirF.Z, 0, dirF.X)
+            local midBase = (fromPos + entry) * 0.5
+            for _, off in ipairs({ 14, -14, 24, -24, 38, -38, 56, -56, 76, -76 }) do
+                consider({ fromPos, midBase + perp * off, entry })
+                consider({ fromPos, fromPos + perp * off, entry + perp * off, entry })
+            end
+        end
+    end
+
+    local navRaw
+    if not best then
+        local groundTo = Vector3.new(entry.X, fromPos.Y, entry.Z)
+        local path = PathfindingService:CreatePath({
+            AgentRadius = 16, AgentHeight = 5, AgentCanJump = true, AgentJumpHeight = 10, AgentMaxSlope = 89,
+        })
+        local FLOAT = 5
+        local nav = { fromPos }
+        local ok = pcall(function()
+            path:ComputeAsync(Vector3.new(fromPos.X, fromPos.Y, fromPos.Z), groundTo)
+        end)
+        if ok and path.Status == Enum.PathStatus.Success then
+            local last = fromPos
+            for _, wp in ipairs(path:GetWaypoints()) do
+                if (wp.Position - last).Magnitude >= 8 then
+                    nav[#nav + 1] = wp.Position + Vector3.new(0, FLOAT, 0)
+                    last = wp.Position
+                end
+            end
+        end
+        nav[#nav + 1] = entry + Vector3.new(0, FLOAT, 0)
+        nav = _pushOffWalls(nav)
+        navRaw = nav
+        consider(nav)
+    end
+
+    local route = best
+    if not route and _clear(fromPos, toPos) then route = { toPos } end
+    if not route and navRaw then route = _pullWide(navRaw) end
+    if not route then route = { toPos } end
+    if (route[#route] - toPos).Magnitude > 0.5 then
+        route[#route + 1] = toPos
+    end
+    return _withPatch(route)
+end
+end
+
+-- [CODE MORT SUPPRIME] equipTool
+
+-- [CODE MORT SUPPRIME] unequipAll
+
+-- [CODE MORT SUPPRIME] xenTween : ancien deplacement par tween, non utilise.
+
+local _Stats = game:GetService("Stats")
+local function _pingMs()
+    local ok, p = pcall(function() return LP:GetNetworkPing() * 1000 end)
+    if ok and type(p) == "number" and p > 0 then return p end
+    local ok2, p2 = pcall(function()
+        return _Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    if ok2 and type(p2) == "number" and p2 > 0 then return p2 end
+    return 0
+end
+local function _pingAdjustSpeed(spd)
+    local thresh = tonumber(_G.MynxxPingThresh) or 170
+    local capped = tonumber(_G.MynxxHighPingSpeed) or 400
+    if _pingMs() >= thresh and spd > capped then return capped end
+    return spd
+end
+
+local function _inVoid(hrp)
+    if not hrp or not hrp.Parent then return true end
+    local voidY = tonumber(_G.MynxxVoidY) or -50
+    return hrp.Position.Y < voidY
+end
+local function _waitOutOfVoid(timeout)
+    local t0 = os.clock()
+    local good = 0
+    while os.clock() - t0 < (timeout or 12) do
+        if _G.MynxxTPStop then return false end
+        local char = LP.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp and hrp.Parent and not _inVoid(hrp) and math.abs(hrp.AssemblyLinearVelocity.Y) < 12 then
+            good += 1
+            if good >= 4 then return true end
+        else
+            good = 0
+        end
+        RunService.Heartbeat:Wait()
+    end
+    return false
+end
+
+-- [SUPPRIME] void-recover standalone (survie), non lie au TP/steal/invis/AP.
+-- _inVoid/_waitOutOfVoid (utilises PAR le TP) restent plus haut.
+
+local isTeleporting = false
+
+-- [CODE MORT SUPPRIME] cframeStepThrough : ancien mode de TP par pas CFrame, non utilise.
+
+-- ===================================================================
+-- DEPENDANCES DE LA SECTION AZAT (portees verbatim, player -> LP)
+-- armSteal / endTP / _cloneTP / _cloneFired /
+-- _lastTPOk / SXE_StealStatus / VanishTPGuardUntil
+-- ===================================================================
+local _cloneTP    = false
+local _cloneFired = false
+local _lastTPOk   = false
+
+local function endTP()
+    _G.SH_Step("TP: termine")
+    isTeleporting = false
+    _G.SH_TpStartDist = nil  -- clear 50% gate on TP end
+end
+
+-- Desactive le lecteur d'animations du perso (script Animate) a chaque spawn.
+-- Remplace l'ancien "unwalk": pas de boucle Heartbeat, une seule fois par perso.
+-- _G.MynxxNoAnim = false pour desactiver.
+do
+    local function killAnimate(char)
+        if not char or _G.MynxxNoAnim == false then return end
+        task.spawn(function()
+            local a = char:FindFirstChild("Animate") or char:WaitForChild("Animate", 5)
+            if a then pcall(function() a.Disabled = true end) end
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            local anim = hum and hum:FindFirstChildOfClass("Animator")
+            if anim then
+                pcall(function()
+                    for _, t in ipairs(anim:GetPlayingAnimationTracks()) do t:Stop(0) end
+                end)
+            end
+        end)
+    end
+    if LP.Character then killAnimate(LP.Character) end
+    LP.CharacterAdded:Connect(killAnimate)
+end
+
+-- ===== doClone / makeOneWay / goToBrainrot : 1:1 Se original (Grabble TP Core) =====
+-- Clone = Heresy _G.SH_InstantClone (Activate + firesignal TeleportToClone).
+-- doVelocityTP is unchanged and still calls doClone() after the sky wait.
+
+-- Wave-safe: no firesignal, uses :activate() + direct remote fire
+_G.SH_InstantClone = function()
+    local player = LP
+    if not player then return end
+    local playerGui = player:FindFirstChildOfClass("PlayerGui") or player:FindFirstChild("PlayerGui")
+    if not playerGui then playerGui = player:WaitForChild("PlayerGui", 3) end
+    if not playerGui then return end
+    local c = player.Character
+    if not c then return end
+    local h = c:FindFirstChildOfClass("Humanoid")
+    if not h then return end
+    local bp = player:FindFirstChild("Backpack")
+    local cl = (bp and bp:FindFirstChild("Quantum Cloner")) or c:FindFirstChild("Quantum Cloner")
+    if not cl then return end
+    pcall(function() h:UnequipTools() end)
+    task.wait()
+    if cl.Parent ~= c then
+        h:EquipTool(cl)
+        task.wait()
+    end
+    local tf = playerGui:FindFirstChild("ToolsFrames")
+    local qc = tf and tf:FindFirstChild("QuantumCloner")
+    -- find "Change With Clone" / "TeleportToClone" / any clone-action button
+    local tb = qc and (
+        qc:FindFirstChild("TeleportToClone")
+        or qc:FindFirstChild("ChangeWithClone")
+        or qc:FindFirstChild("Change With Clone")
+        or _findCloneBtn(qc)
+    )
+    if not tb then tb = _findCloneBtn(playerGui) end
+    _G.isCloning = true
+    cl:Activate()
+    task.wait(0.06)
+    if tb then
+        tb.Visible = true
+        pcall(function() tb:activate() end)
+        pcall(function()
+            local RS = game:GetService("ReplicatedStorage")
+            local rem = RS:FindFirstChild("QuantumCloner") and RS.QuantumCloner:FindFirstChild("OnTeleport")
+            if not rem then
+                for _, v in ipairs(RS:GetDescendants()) do
+                    if v:IsA("RemoteEvent") and (v.Name == "OnTeleport" or v.Name == "TeleportToClone" or v.Name == "QuantumClonerTeleport") then
+                        rem = v; break
+                    end
+                end
+            end
+            if rem then rem:FireServer() end
+        end)
+    else
+        pcall(function()
+            local RS = game:GetService("ReplicatedStorage")
+            for _, v in ipairs(RS:GetDescendants()) do
+                if v:IsA("RemoteEvent") and (v.Name == "OnTeleport" or v.Name == "TeleportToClone") then
+                    v:FireServer(); break
+                end
+            end
+        end)
+    end
+    task.delay(0.55, function() _G.isCloning = false end)
+end
+
+-- PATCHED v4: UseItem fire throttle (server detects rapid-fire)
+-- PATCHED v9: UseItem throttle REMOVED — was breaking autograb (stuck at 1-2%)
+_G.SH_FireUseItem = _G.SH_FireUseItem or function(...)
+    local a = table.pack(...)
+    pcall(function()
+        local r = _G.__tpUseItemRemote
+        if not (r and r.Parent) then r = getRemote("RemoteEvent", "UseItem") end
+        if not r and _G.Net then
+            pcall(function() r = (_G.Net.GetRemote and _G.Net:GetRemote("UseItem")) or _G.Net:RemoteEvent("UseItem") end)
+        end
+        if not r and NetModule then pcall(function() r = NetModule:RemoteEvent("UseItem") end) end
+        if r then r:FireServer(table.unpack(a, 1, a.n)) end
+    end)
+end
+
+function doClone()
+    _G.SH_Step("clone: lance")
+    if type(_G.SH_InstantClone) ~= "function" then
+        _G.SH_Step("clone: echec", "SXEInstantClone indisponible")
+        return false
+    end
+    local ok, err = pcall(_G.SH_InstantClone)
+    if not ok then
+        _G.SH_Step("clone: echec", tostring(err))
+        return false
+    end
+    _G.SH_Step("clone: SXEInstantClone")
+    return true
+end
+
+local function makeOneWay(plat)
+    if not plat then return end
+    local rsConn
+    local lastY = nil
+    local _platHrp = nil
+    rsConn = RunService.Stepped:Connect(function()
+        if not plat or not plat.Parent then
+            if rsConn then rsConn:Disconnect() end
+            return
+        end
+        -- HRP resolu une seule fois: il ne change qu'au respawn, et cette boucle
+        -- le cherchait 2x par frame pendant toute la duree de la plateforme.
+        if not (_platHrp and _platHrp.Parent) then
+            local char = LP.Character
+            _platHrp = char and char:FindFirstChild("HumanoidRootPart")
+        end
+        local hrp = _platHrp
+        if hrp then
+            local currentY = hrp.Position.Y
+            if not lastY then lastY = currentY end
+            local deltaY = currentY - lastY
+            local isMovingUp = (hrp.AssemblyLinearVelocity.Y > 1) or (deltaY > 0.01 and deltaY < 5)
+            -- Valeur calculee puis ecrite SEULEMENT si elle change: avant, la
+            -- propriete etait reecrite a chaque frame meme sans transition.
+            local want = (not isMovingUp) and (currentY > plat.Position.Y + 0.1)
+            if plat.CanCollide ~= want then plat.CanCollide = want end
+            lastY = currentY
+        end
+    end)
+end
+
+-- Se: vol velMoveThrough vers le pet (PAS de CFrame snap)
+local function goToBrainrot(petPos)
+    _G.SH_Step("goToBrainrot: debut", string.format("Y=%.1f", petPos and petPos.Y or -999))
+    if not petPos then return end
+    local char, hrp
+    local _t0 = os.clock()
+    repeat
+        char = LP.Character
+        hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then break end
+        RunService.Heartbeat:Wait()
+    until os.clock() - _t0 > 2
+    if not hrp then return end
+    pcall(function() hrp.Anchored = false end)
+    equipCarpet()
+
+    local h = petPos.Y
+    local targetY = hrp.Position.Y
+    if h > 23.15 then targetY = 21
+    elseif h >= 11 and h <= 23.15 then targetY = 14.5
+    elseif h >= -6.9 and h <= 8.9 then targetY = -5 end  -- tiefer = näher am Boden
+    local _approachF2 = (_G.ApproachFloor2FromFloor1 == true)
+    if _approachF2 and h > 10 and h <= 23.15 then targetY = -4 end
+    local _to = Vector3.new(petPos.X, targetY, petPos.Z)
+
+    if h > 23.15 then
+        local _plat = Instance.new("Part")
+        _plat.Name = "XenHubTempPlatform"
+        _plat.Size = Vector3.new(3, 1, 3)
+        _plat.Position = _to - Vector3.new(0, 5, 0)
+        _plat.Anchored = true
+        _plat.CanCollide = true
+        _plat.Transparency = 1
+        _plat.Material = Enum.Material.SmoothPlastic
+        _plat.Parent = workspace
+        task.spawn(function()
+            local _s = tick()
+            while tick() - _s < 20 do
+                if LP:GetAttribute("Stealing") or _G.MynxxTPStop then break end
+                task.wait(0.1)
+            end
+            if _plat and _plat.Parent then _plat:Destroy() end
+        end)
+    end
+
+    local _route = computeRoute(hrp.Position, _to, nil, 12)
+    if not _route or #_route == 0 then _route = { _to } end
+    -- Vitesse baissee pour ce vol precis (post-clone): a haut ping, une
+    -- progression trop rapide fait que le serveur recoit des positions trop
+    -- eloignees entre 2 paquets et te renvoie en arriere a l'arrivee.
+    -- _G.MynxxBrainrotSpeed pour regler independamment de TPVelocity.
+    velMoveThrough(hrp, _route, math.clamp(tonumber(_G.MynxxBrainrotSpeed) or 250, 20, 800), nil, nil)
+
+    if _approachF2 and h > 10 and h <= 23.15 then
+        local _fUp = os.clock()
+        while hrp and hrp.Parent and (os.clock() - _fUp) < 4 do
+            if LP:GetAttribute("Stealing") or _G.MynxxTPStop then break end
+            local _diff = Vector3.new(petPos.X - hrp.Position.X, 0, petPos.Z - hrp.Position.Z)
+            local _flat = _diff.Magnitude
+            local _vDiff = petPos.Y - hrp.Position.Y
+            if _flat < 3 and math.abs(_vDiff) < 8 then break end
+            local _dir = (_flat > 0.1) and _diff.Unit or Vector3.zero
+            local _yVel = hrp.AssemblyLinearVelocity.Y
+            if _vDiff > 2 then
+                _yVel = math.clamp(_vDiff * 7, 30, 60)
+            elseif _vDiff < -2 then
+                _yVel = math.clamp(_vDiff * 4, -80, 0)
+            end
+            local _ws = (_flat < 3) and 0 or 190
+            hrp.AssemblyLinearVelocity = Vector3.new(_dir.X * _ws, _yVel, _dir.Z * _ws)
+            RunService.Heartbeat:Wait()
+        end
+        local verticalDiff = petPos.Y - hrp.Position.Y
+        if verticalDiff > 2 then
+            local _airPos = Vector3.new(petPos.X, petPos.Y - 8, petPos.Z)
+            local plat = Instance.new("Part")
+            plat.Name = "XiTempPlatform"
+            plat.Size = Vector3.new(6, 1.5, 6)
+            plat.Position = _airPos - Vector3.new(0, 3, 0)
+            plat.Anchored = true
+            plat.CanCollide = false
+            pcall(makeOneWay, plat)
+            plat.Transparency = 1
+            plat.Parent = workspace
+            local startCF = hrp.CFrame
+            local targetCF = CFrame.new(_airPos)
+            local duration = 0.6
+            local start = tick()
+            while tick() - start < duration and hrp.Parent do
+                if LP:GetAttribute("Stealing") or _G.MynxxTPStop then break end
+                local t = (tick() - start) / duration
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.AssemblyAngularVelocity = Vector3.zero
+                hrp.CFrame = startCF:Lerp(targetCF, t)
+                RunService.Heartbeat:Wait()
+            end
+            hrp.CFrame = targetCF
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            task.spawn(function()
+                local st = tick()
+                while (tick() - st) < 20 do
+                    if LP:GetAttribute("Stealing") or _G.MynxxTPStop then break end
+                    task.wait(0.1)
+                end
+                if plat and plat.Parent then plat:Destroy() end
+            end)
+        end
+    end
+
+    if hrp and hrp.Parent then
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end
+end
+
+local _VIM_TP = game:GetService("VirtualInputManager")
+
+-- Heresy grapple MUST run before every TP (even if carpet is already equipped
+-- and the boost window is still open). carpetEngage used to skip in those cases.
+local function fireGrappleBeforeTP(destino)
+    if LP:GetAttribute("Stealing") then return false end
+    if type(_G.SH_FireGrapple2) ~= "function" then
+        _G.SH_Step("TP: grapple avant TP", "SXEFireGrapple2 indisponible")
+        return false
+    end
+    local ok, res = pcall(_G.SH_FireGrapple2, destino)
+    _G.SH_Step("TP: grapple avant TP", (ok and res) and "OK" or ("echec " .. tostring(res)))
+    -- Activate() is deferred; 2 frames so the pull starts before velocity
+    RunService.Heartbeat:Wait()
+    RunService.Heartbeat:Wait()
+    return ok and res and true or false
+end
+
+function doVelocityTP(forceGrapple, _preScanned)
+    _G.__TP_T0 = os.clock()
+    _G.SH_Step("TP: depart", "pets connus=" .. tostring(_preScanned and #_preScanned or "?"))
+    
+    if isTeleporting then return end
+    isTeleporting = true
+    _G.MynxxTPStop = false
+    if not NetModule then pcall(loadNet) end
+
+    -- ── Stable FPS Gate ───────────────────────────────────────────────────────
+    -- PATCHED v11: rewritten FPS measurement.
+    -- Old: used RunService.Heartbeat:Wait() return value — returns 0/nil on some
+    --      executors → 3/0 = inf → gate always passes or errors silently.
+    -- New: os.clock() delta across 5 Heartbeat fires → reliable on all executors.
+    -- Also added 4s hard timeout so gate never hangs forever.
+    if _G.SH_FPSGateEnabled then
+        local _minFps = math.max(1, _G.SH_FPSGateMin or 30)
+
+        local function _measureFps()
+            -- PATCHED v12: count actual Heartbeat fires over 0.5s wall time
+            -- avoids all Heartbeat:Wait() return-value issues on any executor
+            local _count = 0
+            local _conn = RunService.Heartbeat:Connect(function() _count += 1 end)
+            local _t0 = os.clock()
+            task.wait(0.5)
+            _conn:Disconnect()
+            local _elapsed = os.clock() - _t0
+            if _elapsed <= 0 then return 60 end
+            return math.floor(_count / _elapsed)
+        end
+
+        local _fps = _measureFps()
+        if _fps < _minFps then
+            _G.SH_Step("FPS Gate", ("waiting for %d fps (now %d)"):format(_minFps, _fps))
+            local _gateT0 = os.clock()
+            repeat
+                task.wait(0.2)
+                if _G.MynxxTPStop then isTeleporting = false; return end
+                if not _G.SH_FPSGateEnabled then break end
+                -- PATCHED v11: hard 4s timeout — gate never blocks forever
+                if os.clock() - _gateT0 > 4 then
+                    _G.SH_Step("FPS Gate", "timeout — proceeding anyway")
+                    break
+                end
+                _fps = _measureFps()
+            until _fps >= _minFps or not _G.SH_FPSGateEnabled
+        end
+        if _G.MynxxTPStop then isTeleporting = false; return end
+    end
+    -- ─────────────────────────────────────────────────────────────────────────
+
+    local char = LP.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then isTeleporting = false; return end
+
+    if _inVoid(hrp) or hrp.AssemblyLinearVelocity.Y < -40 then
+        _waitOutOfVoid(12)
+        if _G.MynxxTPStop then isTeleporting = false; return end
+        char = LP.Character
+        hrp = char and char:FindFirstChild("HumanoidRootPart")
+        hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not hrp or not hum then isTeleporting = false; return end
+    end
+
+    -- reutilise les pets deja scannes par la boucle appelante (evite la boucle
+    -- d'attente 0.05s qui causait le battement ~0.15s), mais on rafraichit quand
+    -- meme une fois: _preScanned peut avoir ete constitue quelques frames plus tot
+    -- sur un registre encore PARTIEL, et c'est ce qui faisait choisir le plus gros
+    -- M/s d'une liste incomplete. Le memo de scanAllPets rend ce scan gratuit si on
+    -- est dans la meme frame, sinon il ramene les plots arrives depuis.
+    local allPets = _preScanned
+    if type(allPets) ~= "table" or #allPets == 0 then
+        allPets = scanForTP()
+    else
+        local fresh = scanForTP()
+        if type(fresh) == "table" and #fresh > 0 then allPets = fresh end
+    end
+    if #allPets == 0 then
+        local _t0 = os.clock()
+        while #allPets == 0 and os.clock() - _t0 < 4 do
+            task.wait(0.05)
+            allPets = scanForTP()
+        end
+    end
+    if #allPets == 0 then isTeleporting = false; return end
+
+    local pet
+    -- Force target from external TP heartbeat loop (patch_fix21)
+    -- When the external loop already resolved autograb's winner, trust it directly
+    -- and skip the AutoGrab Sync block below (which re-queries SharedState and may
+    -- get a stale/different result causing the wrong pet to be picked).
+    do
+        local _ft = _G.__SH_ForceTarget
+        _G.__SH_ForceTarget = nil
+        if _ft and _ft.position then pet = _ft end
+    end
+    -- AutoGrab Sync: check manualTarget first (patch_fix22)
+    -- SharedState.SelectedPetData is never set — use JAF_GetManualTarget instead
+    if not pet then
+        local _mt = _G.JAF_GetManualTarget and _G.JAF_GetManualTarget()
+        if _mt then
+            local _mtPlot = tostring(_mt.plot or "")
+            local _mtSlot = tostring(_mt.slot or "")
+            local _mtName = (_mt.name or ""):lower()
+            -- plot+slot exact
+            for _, p in ipairs(allPets) do
+                if tostring(p.plot or "") == _mtPlot and tostring(p.slot or "") == _mtSlot then
+                    pet = p; break
+                end
+            end
+            -- name on same plot
+            if not pet and _mtPlot ~= "" and _mtName ~= "" then
+                local b, bm = nil, -1
+                for _, p in ipairs(allPets) do
+                    if tostring(p.plot or "") == _mtPlot then
+                        local pn=(p.name or ""):lower()
+                        if pn:find(_mtName,1,true) and (p.mps or 0) > bm then bm=p.mps or 0; b=p end
+                    end
+                end
+                pet = b
+            end
+            -- name across all plots
+            if not pet and _mtName ~= "" then
+                local b, bm = nil, -1
+                for _, p in ipairs(allPets) do
+                    local pn=(p.name or ""):lower()
+                    if pn:find(_mtName,1,true) and (p.mps or 0) > bm then bm=p.mps or 0; b=p end
+                end
+                pet = b
+            end
+        end
+    end
+    -- Fallback nur wenn AutoGrab kein Ziel hat
+    if not pet then
+    if type(_G.MynxxStealTargetUID) == "string" and _G.MynxxStealTargetUID ~= "" then
+        pet = _findStealTarget(allPets)
+        if not pet then isTeleporting = false; return end
+    else
+        local _pre = _G.__SH_ChosenPet
+        _G.__SH_ChosenPet = nil
+        if _pre and _pre.position then
+            pet = _pre
+        else
+            local bestMpsPet = nil
+            for _, p in ipairs(allPets) do
+                if not p.conveyor then
+                    -- skip player's own plot (patch_fix17)
+                    local _pn = tostring(p.plot or "")
+                    if _pn ~= "" and _G._isMyPlot and _G._isMyPlot(_pn) then
+                        -- own base, never TP here
+                    else
+                        if (not p.mps or p.mps <= 0) and p.index then
+                            p.mps = _up9Mps({ Index = p.index, Mutation = p.mutation, Traits = p.traits }) or 0
+                        end
+                        if bestMpsPet == nil or (p.mps or 0) > (bestMpsPet.mps or 0) then
+                            bestMpsPet = p
+                        end
+                    end
+                end
+            end
+            pet = bestMpsPet or allPets[1]
+        end
+    end
+    end
+
+    local petPos = pet.position
+    local petName = pet.name
+
+    -- Record start distance for autograb 50% gate
+    do
+        local _sc = LP.Character
+        local _sh = _sc and _sc:FindFirstChild("HumanoidRootPart")
+        if _sh then _G.SH_TpStartDist = (_sh.Position - petPos).Magnitude end
+    end
+
+    -- Always fire Heresy grapple toward the pet before this TP starts.
+    fireGrappleBeforeTP(petPos)
+
+    _G.MynxxStealHold = true
+    task.delay(8, function() _G.MynxxStealHold = false end)
+
+    local adjY = petPos.Y
+    if TALL_PETS[petName] then adjY = petPos.Y - TALL_OFFSET end
+    local coordTable = adjY > UPPER_Y_THRESHOLD and UPPER or LOWER
+
+    if false and petPos.Y <= 8.9 and isPlotUnlocked(pet.plot) then -- DEAKTIVIERT: immer von aussen
+        -- carpet deja arme par le prewarm: on ne refait carpetEngage QUE s'il
+        -- n'est pas deja en main (sinon ~0.15s de re-verification pour rien).
+        do
+            local _c = LP.Character
+            local _have = false
+            if _c then
+                for _, n in ipairs(CARPET_NAMES) do
+                    local t = _c:FindFirstChild(n)
+                    if t and t:IsA("Tool") then _have = true; break end
+                end
+            end
+            if not _have then carpetEngage(forceGrapple) end
+        end
+        vZero(hrp)
+        -- Offset nach innen damit der Clone die rote Zone erreicht
+        -- West-Bases (X < -410): Pet-Podium ist rechts -> weiter links reinfahren
+        -- Ost-Bases  (X > -410): Pet-Podium ist links  -> weiter rechts reinfahren
+        local _inbaseOffsetX = 0
+        local _inbaseAmt = tonumber(_G.MynxxInbaseOffset) or 12
+        if petPos.X < -410 then
+            _inbaseOffsetX = -_inbaseAmt  -- West-Seite: nach links (tiefer rein)
+        else
+            _inbaseOffsetX = _inbaseAmt   -- Ost-Seite:  nach rechts (tiefer rein)
+        end
+        local _to = Vector3.new(petPos.X + _inbaseOffsetX, -4, petPos.Z)
+        local route = computeRoute(hrp.Position, _to, nil)
+        if not route or #route == 0 then route = { _to } end
+        local _obSpeed = math.clamp(tonumber(_G.TPVelocity) or 400, 20, 750)
+        -- Vitesse constante: la reduction sous 100 studs a ete retiree.
+        _obSpeed = _pingAdjustSpeed(_obSpeed)
+        -- 1er etage: velocity (pas CFrame)
+        -- Meme jalon que l'autre branche: sans lui, un pet au rez-de-chaussee
+        -- affichait "VELOCITY demarre : --" alors que tout marchait.
+        velMoveThrough(hrp, route, _obSpeed, true, true)
+        if hrp and hrp.Parent then
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end
+        _G.MynxxStealHold = false
+        isTeleporting = false
+        if _G.MynxxTPStop then return end
+        return
+    end
+
+    local closestData, skyKey = findClosest(petPos, coordTable)
+    if not closestData or not skyKey then _G.MynxxStealHold = false; isTeleporting = false; return end
+
+    local destPos = closestData.coord
+
+    local _carpet
+    do
+        local _c = LP.Character
+        local _have = false
+        if _c then
+            for _, n in ipairs(CARPET_NAMES) do
+                local t = _c:FindFirstChild(n)
+                if t and t:IsA("Tool") then _have = true; _carpet = n; break end
+            end
+        end
+        if not _have then _carpet = carpetEngage(forceGrapple) end
+    end
+    vZero(hrp)
+
+    local facingDir = closestData.facing == "NORTH" and Vector3.new(0, 0, -1) or Vector3.new(0, 0, 1)
+
+    local _frontApproach = false
+    do
+        local isUpper = (coordTable == UPPER)
+        local idx = getClosestBaseIdx(petPos)
+        local frontCoord, frontFace = buildFrontCandidate(idx, isUpper, hrp.Position.Z)
+        local bestCoord, bestFace = frontCoord, frontFace
+        local bestDist = (hrp.Position - frontCoord).Magnitude
+        local pickedFront = true
+
+        -- MEME LIGNE -> FRONT: si une autre base de la MEME colonne se trouve
+        -- ENTRE toi et la cible (en Z), approcher par un cote passerait DESSUS
+        -- (grazing -> le TP rate). Dans ce cas on force le FRONT, qui vient
+        -- perpendiculairement (axe X) et ne rase pas la colonne.
+        -- _G.MynxxPreferFrontOnRow = false pour desactiver.
+        local _tb = BASES_LOW[idx]
+        local _isWest = idx <= 4
+        local _rowBlocked = false
+        -- SIDE TP quand la base est PROCHE (~100 studs): a courte distance on
+        -- garde le COTE (rapide, direct). On ne force le FRONT que pour une base
+        -- LOIN et alignee derriere une autre. _G.MynxxSideTPRange = seuil (100).
+        local _dx, _dz = hrp.Position.X - _tb.X, hrp.Position.Z - _tb.Z
+        local _distToBase = math.sqrt(_dx * _dx + _dz * _dz)
+        local _sideRange = tonumber(_G.MynxxSideTPRange) or 100
+        if _G.MynxxPreferFrontOnRow ~= false and _distToBase > _sideRange then
+            for i = 1, 8 do
+                if i ~= idx and (i <= 4) == _isWest then
+                    local bz = BASES_LOW[i].Z
+                    if (bz - hrp.Position.Z) * (bz - _tb.Z) < 0 then _rowBlocked = true; break end
+                end
+            end
+        end
+
+        if not _rowBlocked then
+            for _, d in ipairs(plotSides(coordTable, idx)) do
+                local dd = (hrp.Position - d.coord).Magnitude
+                if dd < bestDist then
+                    bestDist = dd
+                    bestCoord = d.coord
+                    bestFace = d.facing == "NORTH" and Vector3.new(0, 0, -1) or Vector3.new(0, 0, 1)
+                    pickedFront = false
+                end
+            end
+        end
+        destPos = bestCoord
+        facingDir = bestFace
+        _frontApproach = pickedFront
+    end
+
+    if facingDir and facingDir.Magnitude > 0.1 then
+        local axis = facingDir.Unit
+        local toPlayer = hrp.Position - destPos
+        local sign = (axis:Dot(toPlayer) >= 0) and 1 or -1
+        destPos = destPos + axis * sign * (tonumber(_G.MynxxCloneBackoff) or 0.5)
+    end
+
+    local _route = computeRoute(hrp.Position, destPos, facingDir, nil, true)
+    _G.SH_Step("route calculee", "waypoints=" .. tostring(_route and #_route or 0))
+
+    local ASCEND_STEP = 10
+    local _stepped = {}
+    do
+        local prev = hrp.Position
+        for _, wp in ipairs(_route) do
+            local dy = wp.Y - prev.Y
+            if dy > ASCEND_STEP * 1.5 then
+                local n = math.ceil(dy / ASCEND_STEP)
+                for s = 1, n - 1 do
+                    local t = s / n
+                    _stepped[#_stepped + 1] = Vector3.new(
+                        prev.X + (wp.X - prev.X) * t,
+                        prev.Y + dy * t,
+                        prev.Z + (wp.Z - prev.Z) * t
+                    )
+                end
+            end
+            _stepped[#_stepped + 1] = wp
+            prev = wp
+        end
+    end
+    local _mainSpeed = math.clamp(tonumber(_G.TPVelocity) or 400, 20, 750)
+    -- Vitesse constante: la reduction sous 100 studs a ete retiree.
+    _mainSpeed = _pingAdjustSpeed(_mainSpeed)
+    -- 1er etage aussi en velocity (pas CFrame)
+
+    -- Jalon: instant exact ou la velocity demarre. L'ecart avec __TP_T0 est le
+    -- cout du calcul de trajet (findClosest, plotSides, computeRoute, decoupe
+    -- des paliers, calcul de vitesse) -- tout est synchrone, sans yield.
+    _G.SH_Step("VELOCITY: demarre", "vitesse=" .. tostring(math.floor(_mainSpeed)))
+    velMoveThrough(hrp, _stepped, _mainSpeed, true, true)
+    if _G.MynxxTPStop then
+        if hrp and hrp.Parent then vZero(hrp) end
+        _G.MynxxStealHold = false
+        isTeleporting = false
+        return
+    end
+
+    do
+        local above = destPos + Vector3.new(0, 16, 0)
+        local _t0 = os.clock()
+        while os.clock() - _t0 < 1.5 do
+            if not hrp or not hrp.Parent then break end
+            if LP:GetAttribute("Stealing") or _G.MynxxTPStop then break end
+            equipCarpet()
+            local d = above - hrp.Position
+            local flat = Vector3.new(d.X, 0, d.Z).Magnitude
+            if flat <= 3 and hrp.Position.Y >= destPos.Y then break end
+            if d.Y > 3 then
+                local _hum = hrp.Parent and hrp.Parent:FindFirstChildOfClass("Humanoid")
+                if _hum then
+                    local st = _hum:GetState()
+                    if st ~= Enum.HumanoidStateType.Jumping and st ~= Enum.HumanoidStateType.Freefall then
+                        pcall(function() _hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+                        pcall(function() _hum.Jump = true end)
+                    end
+                end
+            end
+            local _approachSpeed = math.clamp(tonumber(_G.TPVelocity) or 320, 20, 750)
+            hrp.Velocity = d.Unit * math.min(_approachSpeed, d.Magnitude * 8)
+            hrp.AssemblyAngularVelocity = Vector3.zero
+            RunService.Heartbeat:Wait()
+        end
+    end
+
+    do
+        local _runCap = math.clamp(tonumber(_G.TPVelocity) or 400, 20, 750)
+        if _frontApproach and tonumber(_G.MynxxFrontRunIn) then
+            _runCap = math.min(_runCap, tonumber(_G.MynxxFrontRunIn))
+        end
+        local _t0 = os.clock()
+        while os.clock() - _t0 < 4 do
+            if not hrp or not hrp.Parent then break end
+            if LP:GetAttribute("Stealing") or _G.MynxxTPStop then break end
+            equipCarpet()
+            local diff = destPos - hrp.Position
+            local mag = diff.Magnitude
+            if mag <= 3 then break end
+            if diff.Y > 3 then
+                local _hum = hrp.Parent and hrp.Parent:FindFirstChildOfClass("Humanoid")
+                if _hum then
+                    local st = _hum:GetState()
+                    if st ~= Enum.HumanoidStateType.Jumping and st ~= Enum.HumanoidStateType.Freefall then
+                        pcall(function() _hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+                        pcall(function() _hum.Jump = true end)
+                    end
+                end
+            end
+            hrp.Velocity = diff.Unit * math.min(_runCap, mag * 8)
+            hrp.AssemblyAngularVelocity = Vector3.zero
+            RunService.Heartbeat:Wait()
+        end
+    end
+
+    if hrp and hrp.Parent and not _G.MynxxTPStop then
+        local _flatOff = Vector3.new(destPos.X - hrp.Position.X, 0, destPos.Z - hrp.Position.Z).Magnitude
+        if _flatOff > 10 then
+            local CRUISE_Y = math.max(destPos.Y, hrp.Position.Y) + 40
+            local function _airborne()
+                local _hum = hrp.Parent and hrp.Parent:FindFirstChildOfClass("Humanoid")
+                if _hum then
+                    local st = _hum:GetState()
+                    if st ~= Enum.HumanoidStateType.Jumping and st ~= Enum.HumanoidStateType.Freefall then
+                        pcall(function() _hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+                        pcall(function() _hum.Jump = true end)
+                    end
+                end
+            end
+            local _t0 = os.clock()
+            while os.clock() - _t0 < 2 do
+                if not hrp or not hrp.Parent or _G.MynxxTPStop or LP:GetAttribute("Stealing") then break end
+                equipCarpet()
+                local dy = CRUISE_Y - hrp.Position.Y
+                if dy <= 2 then break end
+                _airborne()
+                local _climbSpeed = math.clamp(tonumber(_G.MynxxClimb) or _runCap, 20, 800)
+                hrp.Velocity = Vector3.new(0, math.min(_climbSpeed, dy * 8), 0)
+                hrp.AssemblyAngularVelocity = Vector3.zero
+                RunService.Heartbeat:Wait()
+            end
+            _t0 = os.clock()
+            while os.clock() - _t0 < 3 do
+                if not hrp or not hrp.Parent or _G.MynxxTPStop or LP:GetAttribute("Stealing") then break end
+                equipCarpet()
+                local d = Vector3.new(destPos.X - hrp.Position.X, 0, destPos.Z - hrp.Position.Z)
+                if d.Magnitude <= 2.5 then break end
+                _airborne()
+                local lift = math.max(0, CRUISE_Y - hrp.Position.Y) * 4
+                hrp.Velocity = d.Unit * math.min(_runCap, d.Magnitude * 8) + Vector3.new(0, lift, 0)
+                hrp.AssemblyAngularVelocity = Vector3.zero
+                RunService.Heartbeat:Wait()
+            end
+            _t0 = os.clock()
+            while os.clock() - _t0 < 2.5 do
+                if not hrp or not hrp.Parent or _G.MynxxTPStop or LP:GetAttribute("Stealing") then break end
+                equipCarpet()
+                local d = destPos - hrp.Position
+                if d.Magnitude <= 3 then break end
+                local _closeSpeed = math.clamp(tonumber(_G.MynxxCloseSpeed) or _runCap, 20, 750)
+                hrp.Velocity = d.Unit * math.min(_closeSpeed, d.Magnitude * 6)
+                hrp.AssemblyAngularVelocity = Vector3.zero
+                RunService.Heartbeat:Wait()
+            end
+        end
+    end
+
+    -- ===== CLONE + POST-CLONE : 1:1 Se original (doVelocityTP) =====
+    if hrp and hrp.Parent then
+        hrp.CFrame = CFrame.new(hrp.Position, hrp.Position + facingDir)
+    end
+    vZero(hrp)
+
+    local syncFrames = 5
+    local syncConn
+    syncConn = RunService.Heartbeat:Connect(function()
+        if not hrp or not hrp.Parent then syncConn:Disconnect(); return end
+        syncFrames = syncFrames - 1
+        hrp.CFrame = CFrame.new(destPos, destPos + facingDir)
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        if syncFrames <= 0 then syncConn:Disconnect() end
+    end)
+
+    -- Se: grounding ~0.1s max
+    for _ = 1, 5 do
+        task.wait(0.02)
+        if hum and hum.Parent and hum.FloorMaterial ~= Enum.Material.Air then break end
+        if _G.MynxxTPStop then break end
+    end
+
+    pcall(function() if healConn then healConn:Disconnect() end end)
+    isTeleporting = false
+    _cloneFired = true
+
+    if _G.MynxxTPStop then _G.MynxxStealHold = false; endTP(); return end
+
+    -- Se: settle 18 frames / stable >= 2
+    do
+        local stable = 0
+        for _ = 1, 18 do
+            if _G.MynxxTPStop then break end
+            local _hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+            if not _hrp or not _hrp.Parent then break end
+            local flat = (Vector3.new(_hrp.Position.X, 0, _hrp.Position.Z) - Vector3.new(destPos.X, 0, destPos.Z)).Magnitude
+            if flat <= 3.5 and math.abs(_hrp.Position.Y - destPos.Y) <= 4 then
+                stable = stable + 1
+                if stable >= 2 then break end
+            else
+                stable = 0
+                pcall(function() _hrp.CFrame = CFrame.new(destPos, destPos + facingDir) end)
+                _hrp.AssemblyLinearVelocity = Vector3.zero
+                _hrp.AssemblyAngularVelocity = Vector3.zero
+            end
+            RunService.Heartbeat:Wait()
+        end
+    end
+    if _G.MynxxTPStop then _G.MynxxStealHold = false; endTP(); return end
+
+    local _ahrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+
+    -- Charakter gegen die Laser-Wand drücken damit Clone perfekt durchkommt
+    if _ahrp and _ahrp.Parent and not _G.MynxxTPStop then
+        local _wallDir = Vector3.new(facingDir.X, 0, facingDir.Z).Unit
+        local _walkSpeed = 32
+        local _lastWallPos = _ahrp.Position
+        local _stalledFrames = 0
+        local _wt = os.clock()
+        -- Drücke gegen Wand bis Charakter nicht mehr weiter kommt (stalled) oder timeout
+        while not _G.MynxxTPStop and (os.clock() - _wt) < 0.5 do
+            if not (_ahrp and _ahrp.Parent) then break end
+            _ahrp.AssemblyLinearVelocity = _wallDir * _walkSpeed
+            RunService.Heartbeat:Wait()
+            local _moved = (_ahrp.Position - _lastWallPos).Magnitude
+            _lastWallPos = _ahrp.Position
+            if _moved < 0.04 then  -- kaum Bewegung = Wand erreicht
+                _stalledFrames = _stalledFrames + 1
+                if _stalledFrames >= 3 then break end  -- 3 Frames stabil = sicher an der Wand
+            else
+                _stalledFrames = 0
+            end
+        end
+        -- Velocity stoppen
+        if _ahrp and _ahrp.Parent then
+            _ahrp.AssemblyLinearVelocity = Vector3.zero
+        end
+    end
+
+    local _clonePos = (_ahrp and _ahrp.Parent and _ahrp.Position) or destPos
+
+    local _clonePlat = Instance.new("Part")
+    _clonePlat.Name = "XenHubClonePlatform"
+    _clonePlat.Size = Vector3.new(12, 1, 12)
+    _clonePlat.Position = Vector3.new(_clonePos.X, _clonePos.Y - 3, _clonePos.Z)
+    _clonePlat.Anchored = true
+    _clonePlat.CanCollide = true
+    _clonePlat.Transparency = 1
+    _clonePlat.Material = Enum.Material.SmoothPlastic
+    _clonePlat.Parent = workspace
+
+    if _ahrp and _ahrp.Parent then
+        _ahrp.AssemblyLinearVelocity = Vector3.zero
+        _ahrp.AssemblyAngularVelocity = Vector3.zero
+    end
+
+    local _preClonePos, _preCloneChar
+    do
+        _preCloneChar = LP.Character
+        local _h = _preCloneChar and _preCloneChar:FindFirstChild("HumanoidRootPart")
+        _preClonePos = _h and _h.Position or destPos
+    end
+    local _charAdded = false
+    local _caConn = LP.CharacterAdded:Connect(function() _charAdded = true end)
+
+    _G.MynxxStealHold = false
+
+    task.wait(tonumber(_G.TPCloneDelay) or SKY_CLONE_WAIT)
+
+    doClone()
+    if _clonePlat then pcall(function() _clonePlat:Destroy() end); _clonePlat = nil end
+
+    -- Se: attendre le swap jusqu'a 3s
+    do
+        local _t0 = os.clock()
+        repeat
+            if _G.MynxxTPStop then break end
+            if _charAdded then break end
+            if LP.Character ~= _preCloneChar then break end
+            local _h = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+            if _h then
+                local _dx = _h.Position.X - _preClonePos.X
+                local _dz = _h.Position.Z - _preClonePos.Z
+                if (_dx * _dx + _dz * _dz) > 4 then break end
+            end
+            RunService.Heartbeat:Wait()
+        until os.clock() - _t0 > 3
+    end
+    if _caConn then _caConn:Disconnect() end
+
+    if _G.MynxxTPStop then endTP(); return end
+
+    -- Delai fixe apres l'echange avec le clone: la boucle au-dessus sort des
+    -- que le perso a bouge de 2 studs, potentiellement avant que l'echange
+    -- soit fini cote serveur. _G.MynxxPostCloneDelay = 0 pour desactiver.
+    do
+        _G.SH_Step("clone: echange termine")
+        local _d = tonumber(_G.MynxxPostCloneDelay) or 0.1
+        if _d > 0 then task.wait(math.min(_d, 0.5)) end
+    end
+
+    _G._curStealSlot = tonumber(pet and pet.slot) or _G._curStealSlot
+
+    goToBrainrot(petPos)
+    pcall(function()
+        _VIM_TP:SendKeyEvent(true, Enum.KeyCode.C, false, game)
+        task.wait(0.05)
+        _VIM_TP:SendKeyEvent(false, Enum.KeyCode.C, false, game)
+    end)
+
+    pcall(function() if healConn then healConn:Disconnect() end end)
+    _lastTPOk = true
+    endTP()
+    return true
+end
+
+local _manualTPBusy = false
+function manualFullTP()
+    if _manualTPBusy or isTeleporting then return end
+    _manualTPBusy = true
+    local okAll = pcall(function()
+        -- SCHNELLER MANUAL TP: kein Warte-Loop.
+        -- Carpet schon in der Hand? Direkt doVelocityTP.
+        -- Carpet fehlt? Nur 1 schnelles carpetEngage, dann sofort TP.
+        local char = LP.Character
+        local carpetReady = false
+        if char then
+            for _, n in ipairs(CARPET_NAMES) do
+                local t = char:FindFirstChild(n)
+                if t and t:IsA("Tool") then carpetReady = true; break end
+            end
+        end
+        if not carpetReady then
+            -- Carpet fehlt — einmal schnell engagen (max 1.5s)
+            local t0 = os.clock()
+            local done = false
+            task.spawn(function()
+                pcall(carpetEngage, true)
+                done = true
+            end)
+            while not done and os.clock()-t0 < 1.5 do
+                RunService.Heartbeat:Wait()
+            end
+        end
+        -- Pets aus Cache nehmen falls vorhanden — kein Warten
+        local pets = nil
+        pcall(function() pets = scanAllPets() end)
+        doVelocityTP(false, pets)
+    end)
+    _manualTPBusy = false
+    return okAll
+end
+_G.MynxxStartSideTP = manualFullTP
+
+-- ===== lines 4507-4573 from hub a =====
+-- ===== PREWARM PARALLELE =====
+-- Avant: tout etait sequentiel derriere l'attente du personnage.
+-- Les channels ne dependent QUE de workspace.Plots, pas du perso -> demarrage a t=0.
+
+-- A) modules + net immediatement
+task.spawn(function() pcall(loadModules) pcall(loadNet) end)
+
+_G.SH_Step("prewarm outils: debut")
+-- A2) PRE-ATTENTE des outils (Grapple Hook + carpet) EN PARALLELE des le load.
+-- Les outils streament dans l'inventaire ~400-550ms apres le spawn. En les
+-- attendant en fond des maintenant, ils sont deja la quand carpetEngage tourne
+-- => plus de 555ms d'attente du Grapple Hook au milieu de la sequence.
+task.spawn(function()
+    local _tw = os.clock()
+    local hasGrapple, hasCarpet = false, false
+    while os.clock() - _tw < 20 do
+        if not hasGrapple and findTool("Grapple Hook") then
+            hasGrapple = true
+            _G.SH_Step("Grapple Hook trouve", "dans l'inventaire")
+            
+        end
+        if not hasCarpet then
+            for _, n in ipairs(CARPET_NAMES) do
+                if findTool(n) then
+                    hasCarpet = true
+                    
+                    break
+                end
+            end
+        end
+        RunService.Heartbeat:Wait()
+    end
+end)
+
+-- B0) RELANCE AUTONOME DE carpetEngage.
+-- La tache de prewarm carpet (B ci-dessous) meurt parfois avant son 1er jalon:
+-- les 4 lignes "carpet: ..." du diagnostic restent vides et le carpet n'est
+-- jamais engage; doVelocityTP finit par appeler carpetEngage en synchrone.
+-- Cette tache-ci appelle la MEME fonction (donc sequence complete: UseItem,
+-- boost, ordre avec le Grapple Hook -- pas un EquipTool brut qui casserait le
+-- grapple), mais sous pcall: elle ne peut pas mourir.
+-- _G.MynxxCarpetRelance = false pour la desactiver.
+task.spawn(function()
+    if _G.MynxxCarpetRelance == false then return end
+    local _t0 = os.clock()
+    while os.clock() - _t0 < 30 do
+        local inHand = false
+        pcall(function()
+            local ch = LP.Character
+            if ch then
+                for _, n in ipairs(CARPET_NAMES) do
+                    local t = ch:FindFirstChild(n)
+                    if t and t:IsA("Tool") then inHand = true break end
+                end
+            end
+        end)
+        if inHand then return end
+        -- outils presents mais carpet pas en main -> on relance la sequence
+        local ready = false
+        pcall(function()
+            ready = (findTool("Grapple Hook") ~= nil)
+        end)
+        if ready then pcall(function() carpetEngage(true) end) end
+        RunService.Heartbeat:Wait()
+    end
+end)
+
+-- B) CARPET (ordre repris de BYPASS OPTI, ou la velocity partait a la frame ou le
+-- perso touchait le sol).
+-- 1) Le remote UseItem s'attend AVANT le perso: sa resolution tourne en parallele
+--    du chargement depuis t=0, donc elle est deja finie quand le perso spawn.
+--    L'attendre apres le perso serialisait deux attentes qui se chevauchent.
+-- 2) On n'attend PLUS qu'un carpet soit deja dans le Backpack avant de lancer la
+--    sequence. C'etait DEUX ATTENTES EN SERIE: le carpet stream dans l'inventaire,
+--    puis carpetEngage attend a son tour le Grapple Hook. Or carpetEngage se termine
+--    justement par equipCarpet, donc l'attente du carpet est deja incluse et se
+--    chevauche avec celle du grapple. C'est ce que faisait le script de reference.
+task.spawn(function()
+    -- Remote UseItem: attente COURTE (haut ping = Net lent). Ne bloque plus 15s
+    -- le depart TP: doVelocityTP refait carpetEngage de toute facon.
+    do
+        local _rw = os.clock()
+        while os.clock() - _rw < 2 do
+            if _G.__tpRemotesReady then break end
+            local _okR, _r = pcall(function()
+                local g = getRemote or _G.getRemote
+                return type(g) == "function" and g("RemoteEvent", "UseItem") or nil
+            end)
+            if _okR and _r then break end
+            RunService.Heartbeat:Wait()
+        end
+        
+    end
+    local char = LP.Character or LP.CharacterAdded:Wait()
+    char:WaitForChild("HumanoidRootPart", 10)
+    
+    -- Des que les outils sont la + HRP: debloque le TP (engage en parallele).
+    -- Avant: on attendait la FIN de carpetEngage => si UseItem/equip rate au
+    -- haut ping, __invCarpetReady restait false et le TP ne partait jamais.
+    do
+        local _tTools = os.clock()
+        while os.clock() - _tTools < 8 do
+            if findTool("Grapple Hook") then
+                for _, n in ipairs(CARPET_NAMES) do
+                    if findTool(n) then
+                        
+                        task.spawn(function()
+                            pcall(function() carpetEngage(true) end)
+                        end)
+                        return
+                    end
+                end
+            end
+            RunService.Heartbeat:Wait()
+        end
+    end
+    local _tw = os.clock()
+    repeat
+        
+        local cn
+        pcall(function() cn = carpetEngage(true) end)
+        if cn then
+            
+            return
+        end
+        RunService.Heartbeat:Wait()
+    until os.clock() - _tw > 6
+    
+end)
+-- ═════════════ END EXTRACTED SILENCE HUB TP CODE ═════════════
+
+-- ── Public API (consumed by ENGINE 9-A/9-E/9-F and the 10A keybinds) ─────────
+_G.SH_DoVelocityTP  = function(...) return doVelocityTP(...) end
+_G.SH_ManualFullTP  = function(...) return manualFullTP(...) end
+_G.SH_DoClone       = function(...) return doClone(...) end
+_G.SH_ComputeRoute  = computeRoute
+_G.SH_VelMoveThrough = velMoveThrough
+_G.SH_GoToBrainrot  = goToBrainrot
+_G.SH_ScanForTP     = _G.SH_ScanForTP or scanForTP
+_G.SH_IsTeleporting = function() return isTeleporting end
+_G.MynxxStartSideTP = manualFullTP   -- manual TP entry point (used by UI + startup auto-TP)
+
+-- Compatibility mirrors for the Neegy-side flags / stop key:
+--   SH_TPStop (J key)  -> MynxxTPStop (what the Silence engine polls)
+--   isTeleporting      -> SH_TPActive (xray pause / flight noclip / anti-die)
+RunService.Heartbeat:Connect(function()
+    if _G.SH_TPStop == true then _G.MynxxTPStop = true end
+    _G.SH_TPActive = isTeleporting
+end)
+
+end -- ENGINE 9-0 (Silence Hub TP engine)
+
 
 -- ================================================================
 -- ENGINE 9-A : JAF AUTOGRAB / SCANNER ENGINE (from Silence Hub)
@@ -11024,9 +13176,9 @@ RunService.Heartbeat:Connect(function(dt)
     end
 
     if _asP then
-        if _G.SXE_TpStartDist and _G.SXE_TpStartDist > 20 then
+        if _G.SH_TpStartDist and _G.SH_TpStartDist > 20 then
             local _pd = promptDistXZ(_asP)
-            if _pd and _pd > (_G.SXE_TpStartDist * 0.5) then return end
+            if _pd and _pd > (_G.SH_TpStartDist * 0.5) then return end
         end
         if not _asPre and not stealPingGateReady(_asP, _asUid) then return end
         if _G.JAF_RagdollStealSync ~= false and not _asPre then
@@ -11054,1077 +13206,6 @@ RunService.Heartbeat:Connect(function(dt)
 end)
 
 end -- ENGINE 9-A
-
-
--- ================================================================
--- ENGINE 9-B : SYNCHRONIZER CHANNEL HARVEST (from Silence Hub,
--- replaced by Neegy's upvalue method which is more capable)
--- Uses upvalue scanning of Synchronizer.Get to read channel
--- registry directly, with per-frame probing and instance watches.
--- ================================================================
-do
-
-local RS  = game:GetService("ReplicatedStorage")
-local RunSvc = game:GetService("RunService")
-
--- Resolvers (non-blocking)
-local _mask
-local function _maskNow()
-    if _mask and _mask.Parent then return _mask end
-    local c = RS:FindFirstChild("Controllers")
-    _mask = c and c:FindFirstChild("PlotController")
-    return _mask
-end
-
-local _syncMod, _reqInFlight
-local function _getSyncMod()
-    if _syncMod then return _syncMod end
-    local p = RS:FindFirstChild("Packages")
-    local m = p and p:FindFirstChild("Synchronizer")
-    if not m then return nil end
-    if _reqInFlight then return nil end
-    _reqInFlight = true
-    task.spawn(function()
-        local ok, mod = pcall(require, m)
-        if ok and type(mod) == "table" then
-            _syncMod = mod
-        end
-        _reqInFlight = false
-    end)
-    return nil
-end
-_G.VanishGetSyncMod = _getSyncMod
-_G.SH_MaskNow = _maskNow  -- renamed from SXE_MaskNow
-
-local _xchan, _nextTry, _full = nil, 0, false
-local _fullRecheck = 0
-
-local function _regComplete(reg)
-    local p = workspace:FindFirstChild("Plots")
-    if not p then return false end
-    local kids = p:GetChildren()
-    if #kids == 0 then return false end
-    for _, plot in ipairs(kids) do
-        if reg[plot.Name] == nil then return false end
-    end
-    return true
-end
-
--- Upvalue extraction
-local function _getUpvalues(fn)
-    local g = getupvalues or (debug and debug.getupvalues)
-    if type(g) == "function" then
-        local ok, t = pcall(g, fn)
-        if ok and type(t) == "table" then return t end
-    end
-    local gu = getupvalue or (debug and debug.getupvalue)
-    if type(gu) ~= "function" then return nil end
-    local out = {}
-    local lim = tonumber(_G.MynxxUpvalDepth) or 128
-    for i = 1, lim do
-        local ok, a, b = pcall(gu, fn, i)
-        if not ok then break end
-        local v = (b ~= nil) and b or a
-        if v == nil then break end
-        out[i] = v
-    end
-    return out
-end
-
-local function _findChannels(upvals)
-    local found
-    pcall(function()
-        for _, upval in next, upvals do
-            if type(upval) == "table" then
-                for _, val in next, upval do
-                    if type(val) == "table" and rawget(val, "CacheTable") then
-                        found = upval
-                        return
-                    end
-                end
-                for _, v1 in next, upval do
-                    if type(v1) == "table" then
-                        for _, v2 in next, v1 do
-                            if type(v2) == "table" and rawget(v2, "CacheTable") then
-                                found = v1
-                                return
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end)
-    return found
-end
-
-local function _chans()
-    if _xchan then
-        if os.clock() >= _fullRecheck then
-            _fullRecheck = os.clock() + 0.5
-            _full = _regComplete(_xchan)
-        end
-        return _xchan
-    end
-
-    local hot = (os.clock() - (_G.__SH_T0 or _G.__SXE_T0 or 0)) < (tonumber(_G.MynxxHotScanSec) or 8)
-    if not hot and os.clock() < _nextTry then return nil end
-    _nextTry = os.clock() + 0.05
-
-    local sync = _getSyncMod()
-    if not sync then return nil end
-    local getfn
-    pcall(function() getfn = sync.Get end)
-    if type(getfn) ~= "function" then getfn = rawget(sync, "Get") end
-    if type(getfn) ~= "function" then return nil end
-
-    local ups = _getUpvalues(getfn)
-    if type(ups) ~= "table" then return nil end
-
-    local reg = _findChannels(ups)
-    if type(reg) == "table" then
-        local n = 0
-        for _ in pairs(reg) do n = n + 1 end
-        if n > 0 then
-            _xchan = reg
-            if _regComplete(reg) then _full = true end
-            return _xchan
-        end
-    end
-    return nil
-end
-_G.VanishSyncAll = function() return _chans() end
-_G.VanishSyncGet = function(idx)
-    local t = _chans()
-    if not t or idx == nil then return nil end
-    return t[idx]
-end
-
--- Channel getter (renamed from SXE_ChannelGet -> SH_ChannelGet)
-local function _rawChanGet(c, k) return c:Get(k) end
-function _G.SH_ChannelGet(ch, key)
-    if ch == nil or key == nil then return nil end
-    if type(ch) == "table" then
-        local t = rawget(ch, "CacheTable")
-        if type(t) == "table" then
-            local v = t[key]
-            if v ~= nil then return v end
-        end
-    end
-    local ok, v = pcall(_rawChanGet, ch, key)
-    if ok then return v end
-    return nil
-end
-
-function _G.SH_GetPlotChannel(name)
-    return _G.VanishSyncGet(tostring(name))
-end
-
-function _G.SH_SynStatus()
-    local t = _chans()
-    local n = 0
-    if type(t) == "table" then for _ in pairs(t) do n = n + 1 end end
-    return { mod = _syncMod ~= nil, mask = _maskNow() ~= nil, full = _full, channels = n }
-end
-
--- Per-frame probing across all three frame signals
-do
-    local conns = {}
-    local stopped = false
-    local function stopAll()
-        if stopped then return end
-        stopped = true
-        for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
-        conns = {}
-    end
-    local function probe()
-        if stopped then return end
-        if _G.__TP_T0 then stopAll() return end
-        pcall(_G.SH_MaskNow)
-        pcall(_G.VanishSyncAll)
-    end
-
-    local function sig(...)
-        for _, n in ipairs({ ... }) do
-            local ok, s = pcall(function() return RunSvc[n] end)
-            if ok and typeof(s) == "RBXScriptSignal" then return s end
-        end
-        return nil
-    end
-    for _, s in ipairs({
-        sig("PreRender", "RenderStepped"),
-        sig("PreSimulation", "Stepped"),
-        sig("PostSimulation", "Heartbeat"),
-    }) do
-        local ok, c = pcall(function() return s:Connect(probe) end)
-        if ok and c then conns[#conns + 1] = c end
-    end
-
-    -- Instance replication watcher
-    local watch = {
-        Synchronizer = true, PlotController = true,
-        Packages = true, Controllers = true,
-    }
-    do
-        local ok, c = pcall(function()
-            return RS.DescendantAdded:Connect(function(d)
-                if watch[d.Name] then probe() end
-            end)
-        end)
-        if ok and c then conns[#conns + 1] = c end
-    end
-end
-
-end -- ENGINE 9-B
-
-
--- ================================================================
--- ENGINE 9-C : RAILTP <-> AUTO-STEAL SYNC (from Neegy)
--- Bridge between RailTP arrival and steal trigger.
--- Renamed: _G.Taco* -> _G.SH_*, keeps _G.RailTP as-is.
--- ================================================================
-do
-
-task.spawn(function()
-    local _t0 = os.clock()
-    while not (_G.SH_DirectSteal and _G.SH_ScanForTP) and os.clock() - _t0 < 30 do
-        task.wait(0.2)
-    end
-    local LPr = game:GetService("Players").LocalPlayer
-    local RunS = game:GetService("RunService")
-    local _firing = false
-    local function _stealNearestNow(why)
-        if _firing then return end
-        _firing = true
-        task.spawn(function()
-            local _snapUid = (type(_G.SH_StealTargetUID) == "string" and _G.SH_StealTargetUID ~= "")
-                and _G.SH_StealTargetUID or _G.SH_TPChosenUID
-
-            -- Adaptive settle: wait for character to fully stop
-            do
-                local velThresh  = tonumber(_G.SH_RailSettleVelThresh)  or 18
-                local yVelThresh = tonumber(_G.SH_RailSettleYVelThresh) or 8
-                local maxWait    = tonumber(_G.SH_RailSettleMaxWait)    or 0.50
-                local t0 = os.clock()
-                while os.clock() - t0 < maxWait do
-                    local char = LPr.Character
-                    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
-                    if not hrp then break end
-                    local vel = hrp.AssemblyLinearVelocity
-                    if vel.Magnitude < velThresh and math.abs(vel.Y) < yVelThresh then break end
-                    task.wait(0.016)
-                end
-            end
-
-            local preDelay = tonumber(_G.SH_RailStealPreDelay) or 0
-            if preDelay > 0 then task.wait(preDelay) end
-
-            -- Retry loop
-            local deadline = os.clock() + (tonumber(_G.SH_RailStealRetryWindow) or 0.5)
-            local gap      = tonumber(_G.SH_RailStealRetryGap) or 0.25
-            local range    = tonumber(_G.SH_RailStealRange)    or 45
-            local attempts = 0
-            while os.clock() < deadline do
-                local _nowUid = (type(_G.SH_StealTargetUID) == "string" and _G.SH_StealTargetUID ~= "")
-                    and _G.SH_StealTargetUID or _G.SH_TPChosenUID
-                if _snapUid and _nowUid and _nowUid ~= _snapUid then break end
-
-                attempts = attempts + 1
-                local stealing = false
-                pcall(function() stealing = LPr:GetAttribute("Stealing") == true end)
-                if stealing then break end
-                if _G.SH_StealHold == true then break end
-                pcall(function()
-                    local char = LPr.Character
-                    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
-                    if not hrp then return end
-                    local pets = _G.SH_ScanForTP and _G.SH_ScanForTP() or nil
-                    local best, bestD = nil, math.huge
-                    if type(pets) == "table" then
-                        if _snapUid then
-                            for _, p in ipairs(pets) do
-                                if p.position and not p.conveyor then
-                                    local uid = tostring(p.plot) .. "_" .. tostring(p.slot)
-                                    local d   = (p.position - hrp.Position).Magnitude
-                                    if uid == _snapUid and d <= range then
-                                        best = p; bestD = d; break
-                                    end
-                                end
-                            end
-                        end
-                        if not best then
-                            for _, p in ipairs(pets) do
-                                if p.position and not p.conveyor then
-                                    local d = (p.position - hrp.Position).Magnitude
-                                    if d < bestD then bestD = d; best = p end
-                                end
-                            end
-                        end
-                    end
-                    if best and bestD <= range then
-                        if _G.SH_ArmSteal then pcall(_G.SH_ArmSteal, best) end
-                        if _G.SH_DirectSteal then
-                            pcall(_G.SH_DirectSteal, best, (why or "railarrive") .. "#" .. attempts)
-                        end
-                    end
-                end)
-                task.wait(gap)
-            end
-            _firing = false
-        end)
-    end
-
-    -- Re-arming onArrive callback
-    local function _arm()
-        if _G.SH_RailStealSync == false then return end
-        if _G.RailTP and _G.RailTP.onArrive then
-            _G.RailTP.onArrive(function()
-                _stealNearestNow("rail_onarrive")
-                _arm()
-            end)
-        end
-    end
-    _arm()
-
-    -- State backstop: catch idle<-cruising transition
-    local _wasActive = false
-    RunS.Heartbeat:Connect(function()
-        if _G.SH_RailStealSync == false then return end
-        local act = _G.RailTP and _G.RailTP.isActive and _G.RailTP.isActive()
-        if _wasActive and not act then
-            _wasActive = false
-            _stealNearestNow("rail_stateend")
-        elseif act then
-            _wasActive = true
-        end
-    end)
-end)
-
-end -- ENGINE 9-C
-
-
--- ================================================================
--- ENGINE 9-D : STEAL SYSTEM CORE (from Neegy)
--- executeStealAsync + steal bar UI (gold-themed).
--- Renamed: _G.Taco* -> _G.SH_*, keeps gold palette.
--- ================================================================
-do
-
-local Players     = game:GetService("Players")
-local RunService  = game:GetService("RunService")
-local LP          = Players.LocalPlayer
-local PG          = LP:WaitForChild("PlayerGui")
-
--- ── Pet UID helper ────────────────────────────────────────────
-local function _petUid(p)
-    if not p then return nil end
-    return tostring(p.plot) .. "_" .. tostring(p.slot)
-end
-
--- ── findStealPrompt ───────────────────────────────────────────
-local function findStealPrompt(pet)
-    if not pet then return nil end
-    if pet.plot and pet.slot then
-        local plots = workspace:FindFirstChild("Plots")
-        local plot = plots and plots:FindFirstChild(pet.plot)
-        local podiums = plot and plot:FindFirstChild("AnimalPodiums")
-        local podium = podiums and podiums:FindFirstChild(tostring(pet.slot))
-        if podium then
-            local base = podium:FindFirstChild("Base")
-            local spawn = base and base:FindFirstChild("Spawn")
-            local attach = spawn and spawn:FindFirstChild("PromptAttachment")
-            if attach then
-                for _, p in ipairs(attach:GetChildren()) do
-                    if p:IsA("ProximityPrompt") then return p end
-                end
-            end
-            for _, d in ipairs(podium:GetDescendants()) do
-                if d:IsA("ProximityPrompt") then return d end
-            end
-        end
-    end
-    return nil
-end
-
--- ── Steal internals ───────────────────────────────────────────
-local InternalStealCache = {}
-local STEAL_HOLD_DURATION = 1.3
-local STEAL_PROXIMITY = tonumber(_G.SH_StealProximity) or 28
-
-if _G.SH_RemoteStealOn == nil then _G.SH_RemoteStealOn = false end
-
-local function _promptWorldPos(pr)
-    local par = pr and pr.Parent
-    if not par then return nil end
-    if par:IsA("BasePart") then return par.Position end
-    if par:IsA("Attachment") then return par.WorldPosition end
-    local ok, cf = pcall(function() return par:GetPivot() end)
-    if ok then return cf.Position end
-    return nil
-end
-_G.SH_PromptWorldPos = _promptWorldPos
-
-if _G.SH_GoInstantSteal     == nil then _G.SH_GoInstantSteal     = false end
-if _G.SH_RailStealSync      == nil then _G.SH_RailStealSync      = true  end
-if _G.SH_NearBaseStealStart == nil then _G.SH_NearBaseStealStart = 47 end
-if _G.SH_CloseProximity     == nil then _G.SH_CloseProximity     = 18 end
-if _G.SH_StealCommitRange   == nil then _G.SH_StealCommitRange   = 28 end
-
-local _stealHoldStart, _stealHoldActive = 0, false
-local _stealHoldGen = 0
-local _stealTarget, _stealArmedAt = nil, 0
-local _lastTargetPick, _lastPickUid, _currentTargetName = 0, nil, nil
-local _wasHeld = false
-local _stealLastScan, _autoLastScan = 0, 0
-local _hbPromptUid, _hbPrompt, _hbTpos = nil, nil, nil
-
--- ── Gold-themed steal bar UI ──────────────────────────────────
-local UIF, UIFB = Enum.Font.Gotham, Enum.Font.GothamBold
-local function mk(class, parent, props)
-    local o = Instance.new(class)
-    for k, v in pairs(props or {}) do o[k] = v end
-    o.Parent = parent
-    return o
-end
-local function corner(o, r) mk("UICorner", o, { CornerRadius = UDim.new(0, r or 8) }) return o end
-
--- NEEGY PRIV PALETTE (gold-themed)
-local NG_BG   = Color3.fromRGB(10, 8, 18)
-local NG_BG2  = Color3.fromRGB(16, 14, 26)
-local NG_TRK  = Color3.fromRGB(28, 26, 40)
-local NG_ACC  = Color3.fromRGB(200, 168, 75)
-local NG_ACC2 = Color3.fromRGB(228, 198, 105)
-local NG_TXT  = Color3.fromRGB(218, 208, 182)
-
-local stealBarSg, stealBarFill, stealBarTitle, stealBarPct
-local function ensureStealBar()
-    if stealBarSg and stealBarSg.Parent then return end
-    for _, n in ipairs({ "SH_StealBar", "NeegyStealBar", "TacoStealBar" }) do
-        local old = PG:FindFirstChild(n)
-        if old then old:Destroy() end
-    end
-    stealBarSg = mk("ScreenGui", PG, {
-        Name = "SH_StealBar", ResetOnSpawn = false,
-        IgnoreGuiInset = true, DisplayOrder = 120,
-    })
-    local container = corner(mk("Frame", stealBarSg, {
-        Name = "Container",
-        AnchorPoint = Vector2.new(0.5, 1),
-        Position = UDim2.new(0.5, 0, 1, -80),
-        Size = UDim2.fromOffset(280, 46),
-        BackgroundColor3 = NG_BG,
-        BackgroundTransparency = 0,
-        BorderSizePixel = 0,
-    }), 10)
-    mk("UIStroke", container, { Color = Color3.fromRGB(48, 44, 64), Thickness = 1, Transparency = 0 })
-    local wrap = mk("Frame", container, {
-        Name = "Wrap",
-        Size = UDim2.new(1, -18, 1, -10),
-        Position = UDim2.fromOffset(9, 5),
-        BackgroundTransparency = 1,
-    })
-    stealBarTitle = mk("TextLabel", wrap, {
-        Size = UDim2.new(1, -46, 0, 14),
-        Position = UDim2.fromOffset(0, 0),
-        BackgroundTransparency = 1,
-        Font = UIFB, TextSize = 11,
-        TextColor3 = NG_TXT,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        TextTruncate = Enum.TextTruncate.AtEnd,
-        Text = "steal",
-    })
-    stealBarPct = mk("TextLabel", wrap, {
-        Size = UDim2.fromOffset(42, 14),
-        Position = UDim2.new(1, -42, 0, 0),
-        BackgroundTransparency = 1,
-        Font = UIFB, TextSize = 11,
-        TextColor3 = NG_ACC,
-        TextXAlignment = Enum.TextXAlignment.Right,
-        Text = "0%",
-    })
-    local track = corner(mk("Frame", wrap, {
-        Position = UDim2.new(0, 0, 1, -8),
-        Size = UDim2.new(1, 0, 0, 8),
-        BackgroundColor3 = NG_TRK,
-        BackgroundTransparency = 0,
-        BorderSizePixel = 0,
-    }), 4)
-    stealBarFill = corner(mk("Frame", track, {
-        Size = UDim2.new(0, 0, 1, 0),
-        BackgroundColor3 = NG_ACC,
-        BorderSizePixel = 0,
-    }), 4)
-    mk("UIGradient", stealBarFill, {
-        Color = ColorSequence.new(NG_ACC2, NG_ACC),
-    })
-    if _G.SH_UIRegister then pcall(_G.SH_UIRegister, "SH_StealBar", container) end
-    if _G.SH_MakeDraggable then pcall(_G.SH_MakeDraggable, container, "SH_StealBar") end
-    stealBarSg.Enabled = true
-end
-
-local function showStealBar(name, pct)
-    pcall(function()
-        ensureStealBar()
-        pct = math.clamp(tonumber(pct) or 0, 0, 1)
-        stealBarSg.Enabled = true
-        stealBarTitle.Text = name and ("steal  " .. tostring(name)) or "steal"
-        stealBarPct.Text = math.floor(pct * 100 + 0.5) .. "%"
-        stealBarFill.Size = UDim2.new(pct, 0, 1, 0)
-    end)
-end
-
-local function setStealBarPct(pct)
-    if not stealBarSg or not stealBarSg.Enabled then return end
-    pcall(function()
-        pct = math.clamp(tonumber(pct) or 0, 0, 1)
-        stealBarPct.Text = tostring(math.floor(pct * 100 + 0.5)) .. "%"
-        stealBarFill.Size = UDim2.new(pct, 0, 1, 0)
-    end)
-end
-
-local function hideStealBar()
-    pcall(function()
-        ensureStealBar()
-        stealBarSg.Enabled = true
-        stealBarTitle.Text = "steal"
-        stealBarPct.Text = "0%"
-        stealBarFill.Size = UDim2.new(0, 0, 1, 0)
-    end)
-end
-task.defer(hideStealBar)
-
-local function buildStealCallbacks(prompt)
-    if InternalStealCache[prompt] then return end
-    if not prompt or not prompt.Parent then return end
-    local data = { holdCallbacks = {}, triggerCallbacks = {}, holdEndCallbacks = {}, ready = true }
-    local function grab(sig, into)
-        local ok, conns = pcall(getconnections, sig)
-        if ok and type(conns) == "table" then
-            for _, c in ipairs(conns) do
-                if type(c.Function) == "function" then table.insert(into, c.Function) end
-            end
-        end
-    end
-    grab(prompt.PromptButtonHoldBegan, data.holdCallbacks)
-    grab(prompt.Triggered, data.triggerCallbacks)
-    grab(prompt.PromptButtonHoldEnded, data.holdEndCallbacks)
-    if #data.holdCallbacks > 0 or #data.triggerCallbacks > 0 or #data.holdEndCallbacks > 0 then
-        InternalStealCache[prompt] = data
-    end
-end
-
--- Pre-warm hook (renamed Taco -> SH_)
-_G._SH_PrewarmPrompt = function(pet)
-    local rp = findStealPrompt(pet)
-    if rp and rp.Parent then
-        buildStealCallbacks(rp)
-        local uid = (pet and pet.plot and pet.slot)
-            and (tostring(pet.plot) .. "_" .. tostring(pet.slot)) or nil
-        if uid then
-            _hbPromptUid = uid
-            _hbPrompt    = rp
-            _hbTpos      = _promptWorldPos(rp) or pet.position
-        end
-    end
-    return rp
-end
-
--- Bar-early hook
-local _barEarlyGen = 0
-_G._SH_BarEarly = function(petName, cycleSnap)
-    if _G.SH_RemoteStealOn then return end
-    _barEarlyGen = _barEarlyGen + 1
-    local _myBeg = _barEarlyGen
-    local _t0 = _G._SH_GrabLockedAt or os.clock()
-    showStealBar(petName or "?", 0)
-    task.spawn(function()
-        local hold = tonumber(_G.SH_StealHoldDuration) or STEAL_HOLD_DURATION
-        while true do
-            if _myBeg ~= _barEarlyGen then return end
-            if (_G._SH_GrabCycleId or 0) ~= (cycleSnap or 0) then
-                hideStealBar(); return
-            end
-            if _stealHoldActive then return end
-            local el = os.clock() - _t0
-            if el >= hold then setStealBarPct(1); return end
-            setStealBarPct(el / hold)
-            RunService.Heartbeat:Wait()
-        end
-    end)
-end
-
--- Early-steal hook
-_G._SH_EarlySteal = function(pet)
-    if _G.SH_RemoteStealOn then return false end
-    local rp = findStealPrompt(pet)
-    if not (rp and rp.Parent) then return false end
-    buildStealCallbacks(rp)
-    local data = InternalStealCache[rp]
-    if not (data and data.ready) then return false end
-    local _oldMax
-    pcall(function() _oldMax = rp.MaxActivationDistance end)
-    pcall(function() rp.MaxActivationDistance = math.huge end)
-    local uid = (pet and pet.plot and pet.slot)
-        and (tostring(pet.plot) .. "_" .. tostring(pet.slot)) or nil
-    if uid then
-        _hbPromptUid = uid
-        _hbPrompt    = rp
-        _hbTpos      = _promptWorldPos(rp) or pet.position
-    end
-    _barEarlyGen = _barEarlyGen + 1
-    return executeStealAsync(rp, (pet and pet.name) or "?", _oldMax,
-        _G._SH_GrabLockedAt)
-end
-
--- Remote steal helpers (renamed Taco -> SH_)
-local _rawFireServer = Instance.new("RemoteEvent").FireServer
-local _reBegin, _reCommit = nil, nil
-local _reState, _reRetryAt = {}, {}
-local function _re(cache, hash)
-    if cache and cache.Parent then return cache end
-    local st = _reState[hash]
-    if typeof(st) == "Instance" then
-        if st.Parent then return st end
-        _reState[hash] = nil; st = nil
-    end
-    if st == "pending" then return nil end
-    if st == "failed" and os.clock() < (_reRetryAt[hash] or 0) then return nil end
-    _reState[hash] = "pending"
-    task.spawn(function()
-        local got
-        pcall(function()
-            if _G.SH_GetRemote then got = _G.SH_GetRemote("RemoteEvent", hash) end
-        end)
-        if typeof(got) == "Instance" then
-            _reState[hash] = got
-        else
-            _reState[hash] = "failed"
-            _reRetryAt[hash] = os.clock() + (tonumber(_G.SH_RemoteRetry) or 1)
-        end
-    end)
-    task.delay(tonumber(_G.SH_RemoteResolveWait) or 3, function()
-        if _reState[hash] == "pending" then
-            _reState[hash] = "failed"
-            _reRetryAt[hash] = os.clock() + (tonumber(_G.SH_RemoteRetry) or 1)
-        end
-    end)
-    return nil
-end
-
-task.spawn(function()
-    while true do
-        local a = _re(nil, "f40f7d9e-2f0d-4167-b250-899273f46874")
-        local b = _re(nil, "3ba148c9-7ed6-4675-93f8-9f7c356a2c54")
-        task.wait((a and b) and 5 or (tonumber(_G.SH_RemoteWarmGap) or 1))
-    end
-end)
-
-local function _stealBegin()
-    _reBegin = _re(_reBegin, "f40f7d9e-2f0d-4167-b250-899273f46874")
-    if not _reBegin then return false end
-    local t = workspace:GetServerTimeNow() + 124
-    pcall(_rawFireServer, _reBegin, t, "68c86eb7-eb7e-4b4d-96ae-cf7cd847c5b0")
-    pcall(function() _rawFireServer(_reBegin, t, "07b9cc25-2a1f-4a26-a0ec-f2fab578d8bd") end)
-    return true
-end
-
-local function _stealCommit(plot, slot)
-    _reCommit = _re(_reCommit, "3ba148c9-7ed6-4675-93f8-9f7c356a2c54")
-    if not _reCommit then return false end
-    if type(plot) ~= "string" or slot == nil then return false end
-    local sl = tonumber(slot) or slot
-    local t = workspace:GetServerTimeNow() + 31
-    pcall(_rawFireServer, _reCommit, t, "cda5c764-d4e3-45c4-94e4-53a538347590", plot, sl)
-    pcall(function()
-        _rawFireServer(_reCommit, t, "8c852fbf-d542-4ef4-aa28-612e24db8d4a", plot, sl)
-    end)
-    return true
-end
-_G.SH_StealBegin, _G.SH_StealCommit = _stealBegin, _stealCommit
-
--- Direct steal (renamed Taco -> SH_)
-local function _directSteal(pet, reason)
-    if not (pet and type(pet.plot) == "string" and pet.slot ~= nil) then
-        return false, "no_plot_slot"
-    end
-    if _stealHoldActive and (tick() - _stealHoldStart) < (STEAL_HOLD_DURATION + 1) then
-        return false, "busy"
-    end
-    -- Present gate
-    if _G.SH_StealPresentGate ~= false then
-        local _present = true
-        pcall(function()
-            local ch = _G.SH_GetPlotChannel and _G.SH_GetPlotChannel(pet.plot)
-            local al = ch and _G.SH_ChannelGet(ch, "AnimalList")
-            if type(al) == "table" then
-                local e = al[pet.slot]
-                if e == nil then e = al[tonumber(pet.slot) or -1] end
-                if e == nil then e = al[tostring(pet.slot)] end
-                _present = (e ~= nil)
-            end
-        end)
-        if not _present then return false, "not_present" end
-    end
-    if not _stealBegin() then return false, "begin_fail" end
-    local myGen = _stealHoldGen
-    _stealHoldStart = tick()
-    _stealHoldActive = true
-    showStealBar(pet.name, 0)
-    if _G.SH_Log then
-        pcall(_G.SH_Log, "STEAL_FIRE",
-            { pet = pet.name, plot = pet.plot, slot = pet.slot, why = reason or "auto" })
-    end
-    task.spawn(function()
-        local hold = tonumber(_G.SH_StealHoldDuration)
-        if not hold then
-            if _G.SH_StealMode == "nearest" then
-                hold = tonumber(_G.SH_StealHoldNearest) or STEAL_HOLD_DURATION
-            else
-                hold = tonumber(_G.SH_StealHoldPriority) or 0.6
-            end
-        end
-        local myStart = _stealHoldStart
-        pcall(function()
-            while true do
-                if myGen ~= _stealHoldGen then break end
-                local el = tick() - myStart
-                if el >= hold then break end
-                setStealBarPct(el / hold)
-                RunService.Heartbeat:Wait()
-            end
-        end)
-        if myGen ~= _stealHoldGen then
-            if _stealHoldStart == myStart then _stealHoldActive = false end
-            hideStealBar()
-            return
-        end
-        setStealBarPct(1)
-        -- Pre-commit settle gate
-        do
-            local velThresh = tonumber(_G.SH_CommitSettleVelThresh) or 20
-            local maxWait   = tonumber(_G.SH_CommitSettleMaxWait)   or 0.25
-            local t0 = os.clock()
-            local _sc = LP.Character
-            local _sh = _sc and _sc:FindFirstChild("HumanoidRootPart")
-            if _sh then
-                while os.clock() - t0 < maxWait do
-                    if myGen ~= _stealHoldGen then break end
-                    if _sh.AssemblyLinearVelocity.Magnitude < velThresh then break end
-                    RunService.Heartbeat:Wait()
-                end
-            end
-        end
-        if myGen ~= _stealHoldGen then
-            if _stealHoldStart == myStart then _stealHoldActive = false end
-            hideStealBar()
-            return
-        end
-        pcall(_stealCommit, pet.plot, pet.slot)
-        task.delay(tonumber(_G.SH_RemoteVerifyDelay) or 1.2, function()
-            local gone = false
-            pcall(function()
-                local ch = _G.SH_GetPlotChannel and _G.SH_GetPlotChannel(pet.plot)
-                local al = ch and _G.SH_ChannelGet(ch, "AnimalList")
-                if type(al) == "table" then
-                    local e = al[pet.slot]
-                    if e == nil then e = al[tonumber(pet.slot) or -1] end
-                    if e == nil then e = al[tostring(pet.slot)] end
-                    gone = (e == nil)
-                end
-            end)
-            if gone then
-                _G._SH_RemoteFails = 0
-            else
-                _G._SH_RemoteFails = (_G._SH_RemoteFails or 0) + 1
-                if _G._SH_RemoteFails >= (tonumber(_G.SH_RemoteFailMax) or 2)
-                    and _G.SH_RemoteStealOn ~= false then
-                    _G.SH_RemoteStealOn = false
-                end
-            end
-        end)
-        if _stealHoldStart == myStart then _stealHoldActive = false end
-        task.wait(0.2)
-        hideStealBar()
-    end)
-    task.delay(STEAL_HOLD_DURATION + 0.6, hideStealBar)
-    return true, "ok"
-end
-_G.SH_DirectSteal = function(pet, reason)
-    local ok, why = _directSteal(pet, reason)
-    return ok, why
-end
-
-local function remoteStealAsync(pet)
-    return (_directSteal(pet, "auto"))
-end
-
--- executeStealAsync (renamed Taco -> SH_)
-local _esActiveCycle = 0
-local _esGen = 0
-
-function executeStealAsync(prompt, petName, restoreMax, startTime)
-    local _esCycleNow = _G._SH_GrabCycleId or 0
-    local _cycleAdvanced = _esActiveCycle ~= _esCycleNow
-    if _stealHoldActive and not _cycleAdvanced
-        and (tick() - _stealHoldStart) < (STEAL_HOLD_DURATION + 1) then
-        return false
-    end
-    local data = InternalStealCache[prompt]
-    if not data or not data.ready then return false end
-    data.ready = false
-    _esActiveCycle = _esCycleNow
-    _esGen = _esGen + 1
-    local _myGen = _esGen
-    local _myEsCycle = _esCycleNow
-    local _myStart = startTime or os.clock()
-    _stealHoldStart = tick()
-    _stealHoldActive = true
-    pcall(function() prompt.MaxActivationDistance = math.huge end)
-    showStealBar(petName, 0)
-
-    local function _esAbort()
-        if _myGen == _esGen then _stealHoldActive = false end
-        data.ready = true
-        hideStealBar()
-    end
-
-    task.spawn(function()
-        for _, fn in ipairs(data.holdCallbacks) do task.spawn(fn) end
-        local hold = tonumber(_G.SH_StealHoldDuration)
-        if not hold then
-            if _G.SH_StealMode == "nearest" then
-                hold = tonumber(_G.SH_StealHoldNearest) or STEAL_HOLD_DURATION
-            else
-                hold = tonumber(_G.SH_StealHoldPriority) or 0.6
-            end
-        end
-        pcall(function()
-            local hd = prompt.HoldDuration
-            if type(hd) == "number" and hd > 0 then hold = math.max(hold, hd + 0.05) end
-        end)
-        -- Bar fill loop
-        while true do
-            if _myGen ~= _esGen then _esAbort(); return end
-            local el = os.clock() - _myStart
-            if el >= hold then break end
-            setStealBarPct(el / hold)
-            RunService.Heartbeat:Wait()
-        end
-        if _myGen ~= _esGen then _esAbort(); return end
-        setStealBarPct(1)
-        -- Arrive gate
-        if prompt and prompt.Parent then
-            if _G.SH_StealArriveGate ~= false then
-                local _tr = tonumber(restoreMax)
-                if not _tr or _tr <= 0 or _tr == math.huge then
-                    _tr = tonumber(_G.SH_StealPromptRange) or 12
-                end
-                _tr = _tr + (tonumber(_G.SH_StealRangePad) or 2)
-                local _aw0 = os.clock()
-                local _awMax = tonumber(_G.SH_StealArriveWait) or 12
-                while os.clock() - _aw0 < _awMax do
-                    if not (prompt and prompt.Parent) then break end
-                    if _myGen ~= _esGen then break end
-                    local _ac = LP.Character
-                    local _ah = _ac and _ac:FindFirstChild("HumanoidRootPart")
-                    local _ap = _promptWorldPos(prompt)
-                    if _ah and _ap and (_ah.Position - _ap).Magnitude <= _tr then break end
-                    RunService.Heartbeat:Wait()
-                end
-            end
-            if _myGen ~= _esGen then _esAbort(); return end
-            for _, fn in ipairs(data.triggerCallbacks) do task.spawn(fn) end
-        end
-        for _, fn in ipairs(data.holdEndCallbacks) do task.spawn(fn) end
-        if _myGen == _esGen then _stealHoldActive = false end
-        if restoreMax ~= nil then
-            pcall(function()
-                if prompt and prompt.Parent then prompt.MaxActivationDistance = restoreMax end
-            end)
-        end
-        task.wait(0.05)
-        data.ready = true
-        task.wait(0.2)
-        hideStealBar()
-    end)
-    return true
-end
-
-end -- ENGINE 9-D
-
-
--- ================================================================
--- ENGINE 9-E : HEARTBEAT STEAL LOOP (from Neegy)
--- The main Heartbeat-driven steal targeting + firing loop.
--- Renamed: _G.Taco* -> _G.SH_*, keeps _G.RailTP as-is.
--- ================================================================
-do
-
-local Players    = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local LP         = Players.LocalPlayer
-
-local function _petUid(p)
-    if not p then return nil end
-    return tostring(p.plot) .. "_" .. tostring(p.slot)
-end
-
-local function timeUntilCanSteal()
-    if LP:GetAttribute("Stealing") or LP:GetAttribute("IsTrading")
-        or LP:GetAttribute("IsDuelSelecting") or LP:GetAttribute("Web") then
-        return -1
-    end
-    local ragdoll = LP:GetAttribute("RagdollEndTime")
-    if ragdoll then
-        local r = ragdoll - workspace:GetServerTimeNow()
-        if r > 0 then return r end
-    end
-    return 0
-end
-
-local stealOn = (_G.SH_StealMode ~= nil)
-local _emptyScans = 0
-local _lockMiss = 0
-local _lastGateLog, _lastGateReason = 0, ""
-local _stealGateClearedAt = 0
-
-local function _gateLog(reason, dist, nearBase, extra)
-    if not _G.SH_Log then return end
-    local nowc = os.clock()
-    if reason == _lastGateReason and (nowc - _lastGateLog) < 0.5 then return end
-    _lastGateLog, _lastGateReason = nowc, reason
-    local d = { why = reason, dist = math.floor((tonumber(dist) or -1) * 10) / 10, nearBase = nearBase }
-    if extra then for k, v in pairs(extra) do d[k] = v end end
-    pcall(_G.SH_Log, "STEAL_GATE", d)
-end
-
--- NOTE: This heartbeat loop references several upvalues from ENGINE 9-D
--- (findStealPrompt, _promptWorldPos, buildStealCallbacks, InternalStealCache,
--- executeStealAsync, _stealHoldActive, _stealHoldGen, _stealHoldStart,
--- STEAL_HOLD_DURATION, showStealBar, hideStealBar, remoteStealAsync, _petUid).
--- In the merged script those are all in scope via shared _G.SH_* globals
--- or because the engines run in the same environment.
-
--- The full heartbeat steal loop is connected via _G.SH_DirectSteal and
--- _G.SH_StealBegin / _G.SH_StealCommit which were exposed above.
--- The scan + target picking runs through _G.SH_ScanForTP (set by the
--- scan engine) and fires _G.SH_DirectSteal on arrival.
-
-end -- ENGINE 9-E
-
-
--- ================================================================
--- ENGINE 9-F : AUTO-TP ON LOAD (from Neegy, replaces Silence's)
--- Fires doVelocityTP the moment channels are ready after spawn.
--- Renamed: _G.Taco* -> _G.SH_*, keeps _G.RailTP as-is.
--- ================================================================
-do
-
-local Players    = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local LP         = Players.LocalPlayer
-
-_G.SH_ChannelsReady = false
-if _G.SH_AutoTPOnRespawn == nil then _G.SH_AutoTPOnRespawn = false end
-
-local _autoTPBusy = false
-local _autoTPDidFirst = false
-
-local function _runAutoTPForLoad(char)
-    if not char then return end
-    if _G.SH_AutoTP == false then return end
-    if _autoTPDidFirst and _G.SH_AutoTPOnRespawn == false then return end
-    if _autoTPBusy then return end
-    _autoTPBusy = true
-    task.spawn(function()
-        pcall(function()
-            if LP.Character ~= char then return end
-
-            local hrpReady, humReady = false, false
-            task.spawn(function() char:WaitForChild("HumanoidRootPart", 20); hrpReady = true end)
-            task.spawn(function() char:WaitForChild("Humanoid", 20); humReady = true end)
-            local _tw0 = os.clock()
-            while (not hrpReady or not humReady) and os.clock() - _tw0 < 20 do
-                if LP.Character ~= char then return end
-                RunService.Heartbeat:Wait()
-            end
-            -- Load modules if available
-            if _G.SH_LoadModules then pcall(_G.SH_LoadModules) end
-            if _G.SH_LoadNet then pcall(_G.SH_LoadNet) end
-            if _G.SH_AutoTP == false or LP.Character ~= char then return end
-
-            -- Background tool equip (does not gate TP)
-            if _G.SH_WaitForTools ~= false and type(_G.SH_ToolsReady) == "function" then
-                task.spawn(function()
-                    local _tt0 = os.clock()
-                    local _tcap = tonumber(_G.SH_ToolWait) or 30
-                    while os.clock() - _tt0 < _tcap do
-                        if LP.Character ~= char then return end
-                        local ok, ready = pcall(_G.SH_ToolsReady)
-                        if ok and ready then
-                            if _G.SH_EquipCarpet then pcall(_G.SH_EquipCarpet) end
-                            break
-                        end
-                        task.wait(0.03)
-                    end
-                end)
-            else
-                if _G.SH_EquipCarpet then pcall(_G.SH_EquipCarpet) end
-            end
-
-            -- Scan settle: wait for stable target ordering before committing
-            local _w0 = os.clock()
-            local _wMax = tonumber(_G.SH_AutoTPWait) or 20
-            local _need = tonumber(_G.SH_TPSettleFrames) or 1
-            local _depth = tonumber(_G.SH_TPSettleDepth) or 3
-            local _cap = tonumber(_G.SH_TPSettleMax) or 0.3
-            local _sig, _same, _firstHit = nil, 0, nil
-            while os.clock() - _w0 < _wMax do
-                if _G.SH_AutoTP == false or LP.Character ~= char then return end
-                if LP:GetAttribute("Stealing") == true then return end
-                local ok, pets = pcall(function()
-                    if _G.SH_RailScan then return _G.SH_RailScan() end
-                    return nil
-                end)
-                if ok and pets and #pets > 0 then
-                    if _need <= 0 then break end
-                    _firstHit = _firstHit or os.clock()
-                    local parts = {}
-                    for i = 1, math.min(_depth, #pets) do
-                        local p = pets[i]
-                        parts[#parts + 1] = tostring(p.plot) .. ":" .. tostring(p.slot)
-                    end
-                    local nowSig = tostring(#pets) .. "|" .. table.concat(parts, ",")
-                    if nowSig == _sig then
-                        _same = _same + 1
-                        if _same >= _need then break end
-                    else
-                        _sig, _same = nowSig, 0
-                    end
-                    if os.clock() - _firstHit >= _cap then break end
-                    task.wait(tonumber(_G.SH_TPSettleGap) or 0.02)
-                else
-                    task.wait(tonumber(_G.SH_AutoTPPoll) or 0.05)
-                end
-            end
-
-            -- Anti-lagback: wait for smooth frames on first TP
-            if not _autoTPDidFirst and _G.SH_SmoothBeforeTP ~= false and _G.SH_WaitSmooth then
-                pcall(_G.SH_WaitSmooth)
-            end
-            if not _autoTPDidFirst then _G.SH_FirstTPPending = true end
-            if _G.SH_DoVelocityTP then pcall(_G.SH_DoVelocityTP) end
-            _G.SH_FirstTPPending = false
-        end)
-        _autoTPDidFirst = true
-        _autoTPBusy = false
-    end)
-end
-
-if LP.Character then _runAutoTPForLoad(LP.Character) end
-LP.CharacterAdded:Connect(_runAutoTPForLoad)
-
-end -- ENGINE 9-F
 -- ============================================================
 -- SECTION 10 — KEYBINDS, TOGGLE RESTORE, STARTUP AUTO-TP, CLOSE
 -- ============================================================
@@ -12427,7 +13508,7 @@ end)
 
 -- ============================================================
 -- 10D. STARTUP AUTO-TP SEQUENCE (merged silence + neegy)
--- Waits for RailTP + scanner, fires initial TP with settle check
+-- Waits for scanner, fires initial TP with settle check
 -- ============================================================
 _G.SH_ChannelsReady = false
 if _G.SH_AutoTPOnRespawn == nil then _G.SH_AutoTPOnRespawn = false end
