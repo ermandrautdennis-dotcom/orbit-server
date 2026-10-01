@@ -7525,6 +7525,7 @@ _G.SH_ShowStealPanel = function(on)
         if _spGui then _spGui.Enabled = false end
     end
 end
+_G.SH_ShowAutoGrabPanel = _G.SH_ShowStealPanel
 print("[SH] Steal Panel Engine ready.")
 end
 
@@ -13085,6 +13086,25 @@ RunService.Heartbeat:Connect(function(dt)
         _pgKey = nil
     end
 end)
+
+_G.SabcomAutoSteal = function(on)
+    if on == nil then on = true end
+    Config.AutoSteal = on
+end
+
+_G.JAF_GetManualTarget = _G.JAF_GetManualTarget or function()
+    return SharedState and SharedState._currentTpTarget or nil
+end
+
+_G.setStealMode = function(mode)
+    if mode == "Priority" then
+        Config.UsePriority = true; Config.StealNearest = false
+    elseif mode == "Nearest" then
+        Config.UsePriority = false; Config.StealNearest = true
+    elseif mode == "Highest" then
+        Config.UsePriority = false; Config.StealNearest = false
+    end
+end
 
 end -- ENGINE 9-A
 -- ============================================================
