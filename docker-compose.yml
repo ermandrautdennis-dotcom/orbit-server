@@ -1,0 +1,50 @@
+# Local development stack: Postgres + API + Discord bot.
+#
+# Secrets come from a local .env (copy .env.example and run `npm run secrets`).
+# Nothing here is suitable as-is for an internet-facing deployment: the Postgres
+# password is a development default and the API runs without TLS.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: orbit
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-orbit_dev_only}
+      POSTGRES_DB: orbit
+    ports:
+      - "127.0.0.1:5432:5432"   # bound to loopback, not 0.0.0.0
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orbit -d orbit"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      DATABASE_URL: postgresql://orbit:${POSTGRES_PASSWORD:-orbit_dev_only}@postgres:5432/orbit
+      DATABASE_SSL: "false"
+      PORT: "3000"
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  bot:
+    build: .
+    command: sh -c "node bot/register-commands.js && node bot/index.js"
+    env_file: .env
+    environment:
+      API_BASE_URL: http://api:3000
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
